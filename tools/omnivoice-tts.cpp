@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -42,10 +43,14 @@ static void print_usage(const char * prog) {
             "  --duration <sec>        Output duration in seconds (default: estimate from text)\n"
             "  --no-denoise            Omit the <|denoise|> prefix\n"
             "  --ref-wav <path>        Reference WAV for voice cloning\n"
-            "  --ref-text <path>       Transcript file for the reference (required with --ref-wav)\n\n"
+            "  --ref-text <path>       Transcript file for the reference (required with --ref-wav)\n"
+            "  --seed <int>            Sampling seed (default: -1 for random)\n\n"
             "Debug:\n"
             "  --no-fa                 Disable flash attention\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
+            "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n"
+            "  --sm-count <int>        CUDA SM count of the reference device (philox alignment)\n"
+            "  --sm-threads <int>      CUDA max threads per SM of the reference device\n"
             "  --llm-test <input.bin>  Full LLM forward, dump audio_logits\n"
             "  --maskgit-test          Greedy MaskGIT decoder, dump audio_tokens [K, T]\n"
             "                          (no codec decode, reads target text from stdin)\n",
@@ -209,6 +214,10 @@ int main(int argc, char ** argv) {
     const char * output_path            = NULL;
     bool         use_fa                 = true;
     bool         clamp_fp16             = false;
+    int          seed_arg               = -1;
+    const char * dump_dir               = NULL;
+    int          sm_count               = 0;
+    int          max_threads_per_sm     = 0;
     WavFormat    wav_fmt                = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
@@ -236,6 +245,14 @@ int main(int argc, char ** argv) {
             ref_wav_path = argv[++i];
         } else if (strcmp(argv[i], "--ref-text") == 0 && i + 1 < argc) {
             ref_text_path = argv[++i];
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed_arg = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+            dump_dir = argv[++i];
+        } else if (strcmp(argv[i], "--sm-count") == 0 && i + 1 < argc) {
+            sm_count = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sm-threads") == 0 && i + 1 < argc) {
+            max_threads_per_sm = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -284,6 +301,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Resolve sampling seed : -1 picks a fresh random seed from std::random_device,
+    // any other value is used verbatim for reproducible runs across the maskgit
+    // RNG.
+    uint64_t seed_resolved = (seed_arg < 0) ? (uint64_t) std::random_device{}() : (uint64_t) seed_arg;
+    fprintf(stderr, "[CLI] seed = %llu%s\n", (unsigned long long) seed_resolved, (seed_arg < 0) ? " (random)" : "");
+
     BackendPair bp = backend_init("LM");
 
     PipelineTTS pt = {};
@@ -326,11 +349,14 @@ int main(int argc, char ** argv) {
         } else {
             // Force fully greedy run for bytewise reproducibility against the
             // reference dump. Both temperatures at zero collapse the gumbel
-            // paths.
+            // paths, so the CLI seed has no effect here but is wired in for
+            // consistency with the synthesis path.
             MaskgitConfig mg_cfg        = {};
             mg_cfg.class_temperature    = 0.0f;
             mg_cfg.position_temperature = 0.0f;
-            mg_cfg.seed                 = 42;
+            mg_cfg.seed                 = seed_resolved;
+            mg_cfg.sm_count             = sm_count;
+            mg_cfg.max_threads_per_sm   = max_threads_per_sm;
 
             std::string text         = read_stdin_text();
             std::string lang         = prompt_lang ? prompt_lang : "";
@@ -352,8 +378,9 @@ int main(int argc, char ** argv) {
                     prompt_duration_tokens = duration_estimate_tokens(text, "", 0);
                 }
 
-                std::vector<int32_t> tokens = pipeline_tts_generate(
-                    &pt, &tok, text, lang, instruct, prompt_duration_tokens, prompt_denoise, mg_cfg, "", NULL, 0);
+                std::vector<int32_t> tokens =
+                    pipeline_tts_generate(&pt, &tok, text, lang, instruct, prompt_duration_tokens, prompt_denoise,
+                                          mg_cfg, "", NULL, 0, dump_dir);
                 if (tokens.empty()) {
                     rc = 1;
                 } else if (!write_audio_tokens_dump(output_path, pt.lm.num_audio_codebook, prompt_duration_tokens,
@@ -419,10 +446,14 @@ int main(int argc, char ** argv) {
             }
 
             if (rc == 0) {
-                MaskgitConfig mg_cfg        = {};
-                mg_cfg.class_temperature    = 0.0f;
-                mg_cfg.position_temperature = 0.0f;
-                mg_cfg.seed                 = 42;
+                // Defaults mirror OmniVoiceGenerationConfig (Python) :
+                // num_step=32, guidance_scale=2.0, t_shift=0.1,
+                // layer_penalty_factor=5.0, position_temperature=5.0,
+                // class_temperature=0.0. Only the seed is plumbed from the CLI.
+                MaskgitConfig mg_cfg      = {};
+                mg_cfg.seed               = seed_resolved;
+                mg_cfg.sm_count           = sm_count;
+                mg_cfg.max_threads_per_sm = max_threads_per_sm;
 
                 std::string text         = read_stdin_text();
                 std::string lang         = prompt_lang ? prompt_lang : "";
@@ -448,7 +479,7 @@ int main(int argc, char ** argv) {
 
                     std::vector<float> audio = pipeline_tts_synthesize(
                         &pt, &pc, &tok, text, lang, instruct, prompt_duration_tokens, prompt_denoise, mg_cfg, ref_text,
-                        ref_codes.empty() ? NULL : ref_codes.data(), ref_T);
+                        ref_codes.empty() ? NULL : ref_codes.data(), ref_T, dump_dir);
                     if (audio.empty()) {
                         rc = 1;
                     } else if (!audio_write_wav(output_path, audio.data(), (int) audio.size(), pc.sample_rate,

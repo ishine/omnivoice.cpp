@@ -95,7 +95,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const MaskgitConfig & mg_cfg,
                                            const std::string &   ref_text,
                                            const int32_t *       ref_audio_tokens,
-                                           int                   ref_T);
+                                           int                   ref_T,
+                                           const char *          dump_dir);
 
 // Full TTS synthesis : pipeline_tts_generate followed by pipeline_codec_decode.
 // Returns mono waveform at 24 kHz of length T * codec.hop_length, empty on
@@ -113,4 +114,5 @@ std::vector<float> pipeline_tts_synthesize(PipelineTTS *         pt,
                                            const MaskgitConfig & mg_cfg,
                                            const std::string &   ref_text,
                                            const int32_t *       ref_audio_tokens,
-                                           int                   ref_T);
+                                           int                   ref_T,
+                                           const char *          dump_dir);

@@ -1,7 +1,7 @@
 build/
 *.wav
 
-tests/*.bin
+tests/*/
 
 checkpoints/
 models/*.gguf

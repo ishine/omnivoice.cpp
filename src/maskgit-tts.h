@@ -8,6 +8,7 @@
 // for bytewise validation against the reference. Higher temperatures rely
 // on a seedable PRNG and stay reproducible per seed.
 
+#include "philox.h"
 #include "pipeline-tts.h"
 #include "prompt-tts.h"
 
@@ -15,7 +16,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <random>
 #include <vector>
 
 struct MaskgitConfig {
@@ -26,6 +26,12 @@ struct MaskgitConfig {
     float    position_temperature = 5.0f;
     float    class_temperature    = 0.0f;
     uint64_t seed                 = 42;  // only consulted when temperatures > 0
+    // CUDA execution properties of the device PyTorch ran on. Required to
+    // mirror the per kernel philox_offset_per_thread bump computed by
+    // calc_execution_policy. Values 0 fall back to a single block (safe for
+    // small numel < block_size * unroll = 1024).
+    int      sm_count             = 0;
+    int      max_threads_per_sm   = 0;
 };
 
 // Build the cosine timesteps : t_shift * t / (1 + (t_shift - 1) * t) on
@@ -101,15 +107,29 @@ static void maskgit_top_k_filter_inplace(float * x, int V, float ratio) {
 
 // Gumbel augmented sampling : x[v] = x[v] / temperature + gumbel(0, 1).
 // Mirrors the reference _gumbel_sample : single uniform draw per slot,
-// then noise = log(log(u + eps) + eps) negated twice.
-static void maskgit_gumbel_inplace(float * x, int n, float temperature, std::mt19937_64 & rng) {
-    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-    const float                           inv_t = 1.0f / temperature;
+// then noise = log(log(u + eps) + eps) negated twice. Uniforms come from
+// our Philox4x32-10 helper with PyTorch CUDA conventions :
+//   key   = seed
+//   subseq = element index (0 .. n-1)
+//   ctr   = (ctr_lo, 0, subseq_lo, subseq_hi)
+// The caller maintains ctr_lo across successive kernels and advances it via
+// philox_torch_offset_increment_blocks so successive torch.rand_like calls
+// stay aligned with the Python reference.
+static void maskgit_gumbel_inplace(float *    x,
+                                   int        n,
+                                   float      temperature,
+                                   int64_t    seed,
+                                   uint32_t & ctr_lo,
+                                   int        sm_count,
+                                   int        max_threads_per_sm) {
+    const float        inv_t = 1.0f / temperature;
+    std::vector<float> u((size_t) n);
+    philox_uniform_fill(seed, 0, ctr_lo, u.data(), n);
     for (int i = 0; i < n; i++) {
-        float u = uni(rng);
-        float g = -std::log(-std::log(u + 1e-10f) + 1e-10f);
+        float g = -std::log(-std::log(u[i] + 1e-10f) + 1e-10f);
         x[i]    = x[i] * inv_t + g;
     }
+    ctr_lo += philox_torch_offset_increment_blocks((int64_t) n, sm_count, max_threads_per_sm);
 }
 
 // Run the iterative decoder. Returns flat audio_tokens of size K * T (k slow,
@@ -135,7 +155,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS * pt, PromptTTS * promp
     std::vector<float> timesteps = maskgit_timesteps(cfg.num_step, cfg.t_shift);
     std::vector<int>   sched     = maskgit_schedule(cfg.num_step, T * K, timesteps);
 
-    std::mt19937_64 rng(cfg.seed);
+    uint32_t ctr_lo = 0;
 
     fprintf(
         stderr,
@@ -216,7 +236,8 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS * pt, PromptTTS * promp
                 if (cfg.class_temperature > 0.0f) {
                     work.assign(lp, lp + V);
                     maskgit_top_k_filter_inplace(work.data(), V, 0.1f);
-                    maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, rng);
+                    maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo,
+                                           cfg.sm_count, cfg.max_threads_per_sm);
                     sample_src = work.data();
                 }
                 int   best_v = 0;
@@ -248,7 +269,8 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS * pt, PromptTTS * promp
 
         // Optional position-noise.
         if (cfg.position_temperature > 0.0f) {
-            maskgit_gumbel_inplace(confidence.data(), K * T, cfg.position_temperature, rng);
+            maskgit_gumbel_inplace(confidence.data(), K * T, cfg.position_temperature, (int64_t) cfg.seed, ctr_lo,
+                                   cfg.sm_count, cfg.max_threads_per_sm);
         }
 
         // Mask scores of slots that are already decoded (token != mask_id).

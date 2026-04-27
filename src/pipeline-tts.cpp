@@ -8,6 +8,7 @@
 #include "pipeline-tts.h"
 
 #include "bpe.h"
+#include "debug.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -259,7 +260,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const MaskgitConfig & mg_cfg,
                                            const std::string &   ref_text,
                                            const int32_t *       ref_audio_tokens,
-                                           int                   ref_T) {
+                                           int                   ref_T,
+                                           const char *          dump_dir) {
     if (T <= 0) {
         fprintf(stderr, "[TTS] FATAL: T=%d must be positive\n", T);
         return {};
@@ -272,6 +274,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
 
     fprintf(stderr, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d\n", prompt.B_prime, prompt.K, prompt.S_max,
             prompt.c_len, prompt.u_len);
+
+    (void) dump_dir;  // reserved for future intermediate dumps inside the maskgit loop
 
     return maskgit_generate(pt, &prompt, mg_cfg, T);
 }
@@ -289,9 +293,10 @@ std::vector<float> pipeline_tts_synthesize(PipelineTTS *         pt,
                                            const MaskgitConfig & mg_cfg,
                                            const std::string &   ref_text,
                                            const int32_t *       ref_audio_tokens,
-                                           int                   ref_T) {
-    std::vector<int32_t> tokens =
-        pipeline_tts_generate(pt, tok, text, lang, instruct, T, denoise, mg_cfg, ref_text, ref_audio_tokens, ref_T);
+                                           int                   ref_T,
+                                           const char *          dump_dir) {
+    std::vector<int32_t> tokens = pipeline_tts_generate(pt, tok, text, lang, instruct, T, denoise, mg_cfg, ref_text,
+                                                        ref_audio_tokens, ref_T, dump_dir);
     if (tokens.empty()) {
         return {};
     }
@@ -314,6 +319,16 @@ std::vector<float> pipeline_tts_synthesize(PipelineTTS *         pt,
         return {};
     }
 
+    DebugDumper dbg;
+    debug_init(&dbg, dump_dir);
+    int tokens_shape[2] = { K, T };
+    debug_dump_i32_as_f32(&dbg, "mg_tokens", tokens.data(), tokens_shape, 2);
+
     fprintf(stderr, "[TTS] Decode: K=%d T=%d expected_samples=%d\n", K, T, T * pc->hop_length);
-    return pipeline_codec_decode(pc, tokens.data(), K, T);
+    std::vector<float> audio = pipeline_codec_decode(pc, tokens.data(), K, T);
+
+    if (!audio.empty()) {
+        debug_dump_1d(&dbg, "output_audio", audio.data(), (int) audio.size());
+    }
+    return audio;
 }
