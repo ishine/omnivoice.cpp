@@ -21,15 +21,19 @@ import struct
 import subprocess
 import sys
 
+# Strict F32 matmul on both sides. NVIDIA_TF32_OVERRIDE=0 forces full FP32
+# mantissa in cuBLAS for both PyTorch and the C++ child via inheritance.
+# Must be set BEFORE torch imports so the cuBLAS handle reads it on init.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+
 import numpy as np
 import soundfile as sf
 import torch
 
-# Enforce strict F32 math on the Python reference path. PyTorch defaults
-# allow F16 / BF16 reduction inside F32 matmul and TF32 inside cudnn even
-# when matmul.allow_tf32 is False, which silently drifts the reference.
-torch.backends.cuda.matmul.allow_tf32                            = False
-torch.backends.cudnn.allow_tf32                                  = False
+# Belt and suspenders : disable PyTorch's own TF32 toggles too. Some code
+# paths bypass NVIDIA_TF32_OVERRIDE through cudnn or torch internal flags.
+torch.backends.cuda.matmul.allow_tf32                             = False
+torch.backends.cudnn.allow_tf32                                   = False
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 torch.set_float32_matmul_precision("highest")
@@ -290,7 +294,6 @@ def main():
         "--format",      "wav32",
         "--dump",        DUMP_CPP,
         "--no-fa",
-        "--strict-f32",
         "-o",            args.out_cpp,
     ]
     if args.duration:

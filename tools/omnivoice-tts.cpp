@@ -48,7 +48,6 @@ static void print_usage(const char * prog) {
             "  --seed <int>            Sampling seed (default: -1 for random)\n\n"
             "Debug:\n"
             "  --no-fa                 Disable flash attention (matches Python eager attention)\n"
-            "  --strict-f32            Force NVIDIA_TF32_OVERRIDE=0, full FP32 mantissa in cuBLAS\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
             "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n"
             "  --inject-codes <path>   Bypass codec encoder, load ref-audio-codes.bin from path\n"
@@ -195,18 +194,6 @@ static bool resolve_instruct(const VoiceDesign * vd,
 }
 
 int main(int argc, char ** argv) {
-    // Parse strict-f32 before anything else so it lands before CUDA init.
-    // CUBLAS_DEFAULT_MATH on Ampere+ silently uses TF32 for sgemm (10 bit
-    // mantissa). Setting NVIDIA_TF32_OVERRIDE=0 forces full FP32 mantissa,
-    // matching Python torch.backends.cuda.matmul.allow_tf32 = False.
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--strict-f32") == 0) {
-            setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
-            fprintf(stderr, "[CLI] strict-f32: NVIDIA_TF32_OVERRIDE=0\n");
-            break;
-        }
-    }
-
     if (argc <= 1) {
         print_usage(argv[0]);
         return 0;
@@ -243,8 +230,6 @@ int main(int argc, char ** argv) {
             codec_path = argv[++i];
         } else if (strcmp(argv[i], "--no-fa") == 0) {
             use_fa = false;
-        } else if (strcmp(argv[i], "--strict-f32") == 0) {
-            // Already handled above before CUDA init, swallow here.
         } else if (strcmp(argv[i], "--clamp-fp16") == 0) {
             clamp_fp16 = true;
         } else if (strcmp(argv[i], "--llm-test") == 0 && i + 1 < argc) {

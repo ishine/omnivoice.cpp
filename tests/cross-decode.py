@@ -12,9 +12,19 @@ which must reproduce tts-python.wav (modulo whatever post we still have).
 import os
 import struct
 
+# Strict F32 matmul on both sides. NVIDIA_TF32_OVERRIDE=0 forces full FP32
+# mantissa in cuBLAS for both PyTorch and any C++ child via inheritance.
+# Must be set BEFORE torch imports so the cuBLAS handle reads it on init.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+
 import numpy as np
 import soundfile as sf
 import torch
+
+# Belt and suspenders : disable PyTorch's own TF32 toggles too. Some code
+# paths bypass NVIDIA_TF32_OVERRIDE through cudnn or torch internal flags.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32       = False
 
 from omnivoice import OmniVoice
 from omnivoice.utils.common import fix_random_seed

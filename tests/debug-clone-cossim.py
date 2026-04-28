@@ -20,17 +20,21 @@ import struct
 import subprocess
 import sys
 
+# Strict F32 matmul on both sides. NVIDIA_TF32_OVERRIDE=0 forces full FP32
+# mantissa in cuBLAS for both PyTorch and the C++ child via inheritance.
+# Must be set BEFORE torch imports so the cuBLAS handle reads it on init.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+
 import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
 import torchaudio
 
-# Force strict F32 matmul on the Python side. PyTorch enables TF32 by default
-# on Ampere+ which truncates mantissa to 10 bits during matmul, drifting
-# against ggml's strict F32 cuBLAS path. This must run before any cuda init.
+# Belt and suspenders : disable PyTorch's own TF32 toggles too. Some code
+# paths bypass NVIDIA_TF32_OVERRIDE through cudnn or torch internal flags.
 torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.allow_tf32       = False
 
 from omnivoice import OmniVoice
 from omnivoice.utils.common import fix_random_seed
@@ -352,7 +356,6 @@ def main():
         "--dump",          DUMP_CPP,
         "-o",              args.out_cpp,
         "--no-fa",
-        "--strict-f32",
         "--inject-codes",  inject_path,
     ]
     if args.duration:
@@ -371,9 +374,13 @@ def main():
     # Cond and uncond on the same line so a drift localizes to the originating
     # stage. PromptIDs split into zones (style, text, ref-audio, target) when
     # the lengths can be inferred from the prompt log.
-    def pair(name):
-        a, _ = load_dump(os.path.join(DUMP_CPP, name))
-        b, _ = load_dump(os.path.join(DUMP_PT,  name))
+    def pair(name, optional=False):
+        pa = os.path.join(DUMP_CPP, name)
+        pb = os.path.join(DUMP_PT,  name)
+        if optional and (not os.path.exists(pa) or not os.path.exists(pb)):
+            return None, None
+        a, _ = load_dump(pa)
+        b, _ = load_dump(pb)
         return a, b
 
     ca, cb = pair("prompt-cond-ids.bin")
@@ -407,11 +414,17 @@ def main():
             b = b[keep]
         return float(np.max(np.abs(a - b))) if a.size else 0.0
 
-    ra, rb = pair("ref-audio-16k.bin")
-    print(f"[Cossim] RefAudio16k max_abs_diff: {maxabs(ra, rb):.3e} cossim: {cos(ra, rb):.6f} samples: {min(ra.size, rb.size)}")
+    ra, rb = pair("ref-audio-16k.bin", optional=True)
+    if ra is not None:
+        print(f"[Cossim] RefAudio16k max_abs_diff: {maxabs(ra, rb):.3e} cossim: {cos(ra, rb):.6f} samples: {min(ra.size, rb.size)}")
+    else:
+        print(f"[Cossim] RefAudio16k: skipped (codec encoder bypassed via --inject-codes)")
 
-    fa, fb = pair("ref-hubert-features.bin")
-    print(f"[Cossim] HuBERT-features cossim: {cos(fa, fb):.6f} max_abs_diff: {maxabs(fa, fb):.3e} shape_cpp: {fa.shape} shape_pt: {fb.shape}")
+    fa, fb = pair("ref-hubert-features.bin", optional=True)
+    if fa is not None:
+        print(f"[Cossim] HuBERT-features cossim: {cos(fa, fb):.6f} max_abs_diff: {maxabs(fa, fb):.3e} shape_cpp: {fa.shape} shape_pt: {fb.shape}")
+    else:
+        print(f"[Cossim] HuBERT-features: skipped (codec encoder bypassed via --inject-codes)")
 
     ka, kb = pair("ref-audio-codes.bin")
     n_k = min(ka.size, kb.size)
