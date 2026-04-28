@@ -144,8 +144,8 @@ static inline void philox_randn(int64_t seed, float * out, int n, bool bf16_roun
 //   output    = (r.x + 0.5) * 2^-32  in (0, 1)
 //
 // The ctr_lo parameter is the cumulative Philox block counter that the caller
-// advances between successive kernels via philox_torch_offset_increment_blocks.
-// On a single kernel run (typical first call after manual_seed), ctr_lo = 0.
+// advances between successive kernels. On a single kernel run (typical first
+// call after manual_seed), ctr_lo = 0.
 static inline void philox_uniform_fill(int64_t seed, int64_t subseq_start, uint32_t ctr_lo, float * out, int n) {
     uint32_t slo = (uint32_t) seed;
     uint32_t shi = (uint32_t) ((uint64_t) seed >> 32);
@@ -155,36 +155,4 @@ static inline void philox_uniform_fill(int64_t seed, int64_t subseq_start, uint3
         Philox4  r   = philox4x32_10(ctr, slo, shi);
         out[k]       = ((float) r.x + 0.5f) * CURAND_2POW32_INV;
     }
-}
-
-// Mirror of PyTorch's calc_execution_policy counter offset, expressed in
-// Philox blocks (one block = 4 uniforms = one philox4x32_10 round).
-//
-// PyTorch CUDA launcher chooses :
-//   block_size = 256
-//   unroll     = 4
-//   grid       = min(sm_count * (max_threads_per_sm / block_size),
-//                    ceil(numel / block_size))
-//   pytorch_increment_uniforms = ceil(numel / (block_size * grid * unroll)) * unroll
-// and then advances philox_offset_per_thread_ += pytorch_increment_uniforms.
-// Since each Philox block emits 4 uniforms, ctr.x advances by
-// pytorch_increment_uniforms / 4. For numel <= block_size * grid * unroll
-// this collapses to 1, which is the regime of the OmniVoice maskgit loop on
-// modern GPUs.
-static inline uint32_t philox_torch_offset_increment_blocks(int64_t numel, int sm_count, int max_threads_per_sm) {
-    constexpr int block_size = 256;
-    constexpr int unroll     = 4;
-    if (sm_count <= 0 || max_threads_per_sm < block_size) {
-        // Fallback : assume the grid covers all elements in one wave, which
-        // collapses the increment to one Philox block. Correct for small
-        // numel and for the first kernel after manual_seed.
-        return 1;
-    }
-    int     blocks_per_sm = max_threads_per_sm / block_size;
-    int64_t max_grid      = (int64_t) sm_count * (int64_t) blocks_per_sm;
-    int64_t grid_need     = (numel + block_size - 1) / block_size;
-    int64_t grid          = grid_need < max_grid ? grid_need : max_grid;
-    int64_t slab          = (int64_t) block_size * grid * (int64_t) unroll;
-    int64_t blocks        = (numel + slab - 1) / slab;
-    return (uint32_t) blocks;
 }

@@ -27,12 +27,6 @@ struct MaskgitConfig {
     float    position_temperature = 5.0f;
     float    class_temperature    = 0.0f;
     uint64_t seed                 = 42;  // only consulted when temperatures > 0
-    // CUDA execution properties of the device PyTorch ran on. Required to
-    // mirror the per kernel philox_offset_per_thread bump computed by
-    // calc_execution_policy. Values 0 fall back to a single block (safe for
-    // small numel < block_size * unroll = 1024).
-    int      sm_count             = 0;
-    int      max_threads_per_sm   = 0;
 };
 
 // Build the cosine timesteps : t_shift * t / (1 + (t_shift - 1) * t) on
@@ -115,16 +109,9 @@ static void maskgit_top_k_filter_inplace(float * x, int V, float ratio) {
 //   key   = seed
 //   subseq = element index (0 .. n-1)
 //   ctr   = (ctr_lo, 0, subseq_lo, subseq_hi)
-// The caller maintains ctr_lo across successive kernels and advances it via
-// philox_torch_offset_increment_blocks so successive torch.rand_like calls
-// stay aligned with the Python reference.
-static void maskgit_gumbel_inplace(float *    x,
-                                   int        n,
-                                   float      temperature,
-                                   int64_t    seed,
-                                   uint32_t & ctr_lo,
-                                   int        sm_count,
-                                   int        max_threads_per_sm) {
+// The caller maintains ctr_lo across successive kernels so successive
+// torch.rand_like calls stay aligned with the Python reference.
+static void maskgit_gumbel_inplace(float * x, int n, float temperature, int64_t seed, uint32_t & ctr_lo) {
     const float        inv_t = 1.0f / temperature;
     std::vector<float> u((size_t) n);
     philox_uniform_fill(seed, 0, ctr_lo, u.data(), n);
@@ -132,7 +119,11 @@ static void maskgit_gumbel_inplace(float *    x,
         float g = -std::log(-std::log(u[i] + 1e-10f) + 1e-10f);
         x[i]    = x[i] * inv_t + g;
     }
-    ctr_lo += philox_torch_offset_increment_blocks((int64_t) n, sm_count, max_threads_per_sm);
+    // PyTorch advances philox_offset_per_thread by ceil(numel / slab) blocks
+    // between kernels (slab = block_size * grid * unroll, ~1.15M elements on
+    // any GPU >= 80 SM). With OmniVoice's numel <= K * V ~ 8200, this ratio
+    // is always 1, so we just bump ctr_lo by one block.
+    ctr_lo += 1;
 }
 
 // Run the iterative decoder. Returns flat audio_tokens of size K * T (k slow,
@@ -255,8 +246,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                 if (cfg.class_temperature > 0.0f) {
                     work.assign(lp, lp + V);
                     maskgit_top_k_filter_inplace(work.data(), V, 0.1f);
-                    maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo,
-                                           cfg.sm_count, cfg.max_threads_per_sm);
+                    maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo);
                     sample_src = work.data();
                 }
                 int   best_v = 0;
@@ -300,8 +290,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
         // Optional position-noise.
         if (cfg.position_temperature > 0.0f) {
-            maskgit_gumbel_inplace(confidence.data(), K * T, cfg.position_temperature, (int64_t) cfg.seed, ctr_lo,
-                                   cfg.sm_count, cfg.max_threads_per_sm);
+            maskgit_gumbel_inplace(confidence.data(), K * T, cfg.position_temperature, (int64_t) cfg.seed, ctr_lo);
         }
 
         // Mask scores of slots that are already decoded (token != mask_id).

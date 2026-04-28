@@ -48,16 +48,6 @@ CKPT       = "../checkpoints/OmniVoice"
 DUMP_CPP   = "cpp"
 DUMP_PT    = "python"
 
-def cuda_props():
-    """Return (sm_count, max_threads_per_sm) of the active CUDA device.
-    Used to mirror PyTorch's calc_execution_policy in the C++ Philox helper.
-    Returns (0, 0) when CUDA is unavailable, which is fine for tests run on
-    CPU (the C++ path falls back to a single Philox block per kernel)."""
-    if not torch.cuda.is_available():
-        return 0, 0
-    p = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return p.multi_processor_count, p.max_threads_per_multi_processor
-
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
@@ -251,8 +241,6 @@ def main():
 
     # Python reference path : F32, voice design male, no pre or post process.
     fix_random_seed(args.seed)
-    sm, mt = cuda_props()
-    print(f"[Cuda] sm_count: {sm} max_threads_per_sm: {mt}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model  = OmniVoice.from_pretrained(
         CKPT,
@@ -287,8 +275,6 @@ def main():
         "--model",       MODEL_LM,
         "--codec",       MODEL_CDC,
         "--seed",        str(args.seed),
-        "--sm-count",    str(sm),
-        "--sm-threads",  str(mt),
         "--instruct",    args.instruct,
         "--lang",        args.lang,
         "--format",      "wav32",

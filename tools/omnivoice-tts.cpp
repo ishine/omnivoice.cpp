@@ -51,8 +51,6 @@ static void print_usage(const char * prog) {
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
             "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n"
             "  --inject-codes <path>   Bypass codec encoder, load ref-audio-codes.bin from path\n"
-            "  --sm-count <int>        CUDA SM count of the reference device (philox alignment)\n"
-            "  --sm-threads <int>      CUDA max threads per SM of the reference device\n"
             "  --llm-test <input.bin>  Full LLM forward, dump audio_logits\n"
             "  --maskgit-test          Greedy MaskGIT decoder, dump audio_tokens [K, T]\n"
             "                          (no codec decode, reads target text from stdin)\n",
@@ -219,8 +217,6 @@ int main(int argc, char ** argv) {
     bool         clamp_fp16             = false;
     int          seed_arg               = -1;
     const char * dump_dir               = NULL;
-    int          sm_count               = 0;
-    int          max_threads_per_sm     = 0;
     WavFormat    wav_fmt                = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
@@ -254,10 +250,6 @@ int main(int argc, char ** argv) {
             seed_arg = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
             dump_dir = argv[++i];
-        } else if (strcmp(argv[i], "--sm-count") == 0 && i + 1 < argc) {
-            sm_count = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--sm-threads") == 0 && i + 1 < argc) {
-            max_threads_per_sm = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -360,8 +352,6 @@ int main(int argc, char ** argv) {
             mg_cfg.class_temperature    = 0.0f;
             mg_cfg.position_temperature = 0.0f;
             mg_cfg.seed                 = seed_resolved;
-            mg_cfg.sm_count             = sm_count;
-            mg_cfg.max_threads_per_sm   = max_threads_per_sm;
 
             std::string text         = read_stdin_text();
             std::string lang         = prompt_lang ? prompt_lang : "";
@@ -532,10 +522,8 @@ int main(int argc, char ** argv) {
                 // num_step=32, guidance_scale=2.0, t_shift=0.1,
                 // layer_penalty_factor=5.0, position_temperature=5.0,
                 // class_temperature=0.0. The seed is plumbed from the CLI.
-                MaskgitConfig mg_cfg      = {};
-                mg_cfg.seed               = seed_resolved;
-                mg_cfg.sm_count           = sm_count;
-                mg_cfg.max_threads_per_sm = max_threads_per_sm;
+                MaskgitConfig mg_cfg = {};
+                mg_cfg.seed          = seed_resolved;
 
                 std::string text         = read_stdin_text();
                 std::string lang         = prompt_lang ? prompt_lang : "";

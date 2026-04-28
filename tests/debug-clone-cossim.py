@@ -46,12 +46,6 @@ CKPT       = "../checkpoints/OmniVoice"
 DUMP_CPP   = "cpp"
 DUMP_PT    = "python"
 
-def cuda_props():
-    if not torch.cuda.is_available():
-        return 0, 0
-    p = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return p.multi_processor_count, p.max_threads_per_multi_processor
-
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
@@ -310,8 +304,6 @@ def main():
     print(f"[Input] Seed: {args.seed}")
 
     fix_random_seed(args.seed)
-    sm, mt = cuda_props()
-    print(f"[Cuda] sm_count: {sm} max_threads_per_sm: {mt}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model  = OmniVoice.from_pretrained(
         CKPT,
@@ -347,8 +339,6 @@ def main():
         "--model",         MODEL_LM,
         "--codec",         MODEL_CDC,
         "--seed",          str(args.seed),
-        "--sm-count",      str(sm),
-        "--sm-threads",    str(mt),
         "--ref-wav",       args.ref_audio,
         "--ref-text",      args.ref_text,
         "--lang",          args.lang,
