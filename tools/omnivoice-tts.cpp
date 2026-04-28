@@ -16,6 +16,7 @@
 #include "version.h"
 #include "voice-design.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,13 +47,13 @@ static void print_usage(const char * prog) {
             "  --ref-text <path>       Transcript file for the reference (required with --ref-wav)\n"
             "  --seed <int>            Sampling seed (default: -1 for random)\n\n"
             "Debug:\n"
-            "  --no-fa                 Disable flash attention\n"
+            "  --no-fa                 Disable flash attention (matches Python eager attention)\n"
+            "  --strict-f32            Force NVIDIA_TF32_OVERRIDE=0, full FP32 mantissa in cuBLAS\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
             "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n"
+            "  --inject-codes <path>   Bypass codec encoder, load ref-audio-codes.bin from path\n"
             "  --sm-count <int>        CUDA SM count of the reference device (philox alignment)\n"
             "  --sm-threads <int>      CUDA max threads per SM of the reference device\n"
-            "  --pos-temp <float>      Override MaskGIT position_temperature (default 5.0)\n"
-            "  --cls-temp <float>      Override MaskGIT class_temperature (default 0.0)\n"
             "  --llm-test <input.bin>  Full LLM forward, dump audio_logits\n"
             "  --maskgit-test          Greedy MaskGIT decoder, dump audio_tokens [K, T]\n"
             "                          (no codec decode, reads target text from stdin)\n",
@@ -194,6 +195,18 @@ static bool resolve_instruct(const VoiceDesign * vd,
 }
 
 int main(int argc, char ** argv) {
+    // Parse strict-f32 before anything else so it lands before CUDA init.
+    // CUBLAS_DEFAULT_MATH on Ampere+ silently uses TF32 for sgemm (10 bit
+    // mantissa). Setting NVIDIA_TF32_OVERRIDE=0 forces full FP32 mantissa,
+    // matching Python torch.backends.cuda.matmul.allow_tf32 = False.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--strict-f32") == 0) {
+            setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
+            fprintf(stderr, "[CLI] strict-f32: NVIDIA_TF32_OVERRIDE=0\n");
+            break;
+        }
+    }
+
     if (argc <= 1) {
         print_usage(argv[0]);
         return 0;
@@ -213,6 +226,7 @@ int main(int argc, char ** argv) {
     bool         prompt_denoise         = true;
     const char * ref_wav_path           = NULL;
     const char * ref_text_path          = NULL;
+    const char * inject_codes_path      = NULL;
     const char * output_path            = NULL;
     bool         use_fa                 = true;
     bool         clamp_fp16             = false;
@@ -220,8 +234,6 @@ int main(int argc, char ** argv) {
     const char * dump_dir               = NULL;
     int          sm_count               = 0;
     int          max_threads_per_sm     = 0;
-    float        cli_pos_temp           = -1.0f;
-    float        cli_cls_temp           = -1.0f;
     WavFormat    wav_fmt                = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
@@ -231,6 +243,8 @@ int main(int argc, char ** argv) {
             codec_path = argv[++i];
         } else if (strcmp(argv[i], "--no-fa") == 0) {
             use_fa = false;
+        } else if (strcmp(argv[i], "--strict-f32") == 0) {
+            // Already handled above before CUDA init, swallow here.
         } else if (strcmp(argv[i], "--clamp-fp16") == 0) {
             clamp_fp16 = true;
         } else if (strcmp(argv[i], "--llm-test") == 0 && i + 1 < argc) {
@@ -249,6 +263,8 @@ int main(int argc, char ** argv) {
             ref_wav_path = argv[++i];
         } else if (strcmp(argv[i], "--ref-text") == 0 && i + 1 < argc) {
             ref_text_path = argv[++i];
+        } else if (strcmp(argv[i], "--inject-codes") == 0 && i + 1 < argc) {
+            inject_codes_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed_arg = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
@@ -257,10 +273,6 @@ int main(int argc, char ** argv) {
             sm_count = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sm-threads") == 0 && i + 1 < argc) {
             max_threads_per_sm = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--pos-temp") == 0 && i + 1 < argc) {
-            cli_pos_temp = (float) atof(argv[++i]);
-        } else if (strcmp(argv[i], "--cls-temp") == 0 && i + 1 < argc) {
-            cli_cls_temp = (float) atof(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
@@ -421,9 +433,55 @@ int main(int argc, char ** argv) {
             std::vector<int32_t> ref_codes;
             int                  ref_T = 0;
             std::string          ref_text;
-            if (ref_wav_path) {
+            if (ref_wav_path || inject_codes_path) {
                 if (!read_text_file(ref_text_path, ref_text)) {
                     rc = 1;
+                } else if (inject_codes_path) {
+                    // Bypass : load codes from a Python save_dump file
+                    //   [i32 ndim=2][i32 K][i32 T][f32 K*T data]
+                    // Codes are stored as float32 by save_dump but represent
+                    // exact integer values, so cast back to i32 is lossless.
+                    FILE * f = fopen(inject_codes_path, "rb");
+                    if (!f) {
+                        fprintf(stderr, "[CLI] ERROR: failed to open %s\n", inject_codes_path);
+                        rc = 1;
+                    } else {
+                        int32_t ndim     = 0;
+                        int32_t K_loaded = 0, T_loaded = 0;
+                        size_t  rd = 0;
+                        rd += fread(&ndim, sizeof(int32_t), 1, f);
+                        rd += fread(&K_loaded, sizeof(int32_t), 1, f);
+                        rd += fread(&T_loaded, sizeof(int32_t), 1, f);
+                        const int K_expected = pt.lm.num_audio_codebook;
+                        if (rd != 3 || ndim != 2 || K_loaded != K_expected || T_loaded <= 0) {
+                            fprintf(stderr, "[CLI] ERROR: bad inject-codes header ndim=%d K=%d T=%d (expected K=%d)\n",
+                                    ndim, K_loaded, T_loaded, K_expected);
+                            rc = 1;
+                        } else {
+                            size_t             n = (size_t) K_loaded * (size_t) T_loaded;
+                            std::vector<float> raw(n);
+                            size_t             got = fread(raw.data(), sizeof(float), n, f);
+                            if (got != n) {
+                                fprintf(stderr, "[CLI] ERROR: inject-codes short read got=%zu expected=%zu\n", got, n);
+                                rc = 1;
+                            } else {
+                                ref_codes.resize(n);
+                                for (size_t i = 0; i < n; i++) {
+                                    ref_codes[i] = (int32_t) raw[i];
+                                }
+                                ref_T = T_loaded;
+                                fprintf(stderr, "[TTS] Reference: injected codes from %s [K=%d, T=%d]\n",
+                                        inject_codes_path, K_loaded, T_loaded);
+                                if (dump_dir) {
+                                    DebugDumper dbg;
+                                    debug_init(&dbg, dump_dir);
+                                    int ref_shape[2] = { K_loaded, T_loaded };
+                                    debug_dump_i32_as_f32(&dbg, "ref-audio-codes", ref_codes.data(), ref_shape, 2);
+                                }
+                            }
+                        }
+                        fclose(f);
+                    }
                 } else {
                     int     n_samples = 0;
                     float * ref_audio = audio_read_mono(ref_wav_path, 24000, &n_samples);
@@ -431,9 +489,34 @@ int main(int argc, char ** argv) {
                         fprintf(stderr, "[CLI] ERROR: failed to load %s\n", ref_wav_path);
                         rc = 1;
                     } else {
-                        fprintf(stderr, "[TTS] Reference: %s, %d samples @ 24 kHz mono (%.2f s)\n", ref_wav_path,
-                                n_samples, (double) n_samples / 24000.0);
-                        ref_codes = pipeline_codec_encode(&pc, ref_audio, n_samples);
+                        // Mirror Python OmniVoice : auto loudness normalization
+                        // when ref RMS is in (0, 0.1). Scales the buffer so
+                        // that the new RMS hits exactly 0.1.
+                        double sumsq = 0.0;
+                        for (int i = 0; i < n_samples; i++) {
+                            sumsq += (double) ref_audio[i] * (double) ref_audio[i];
+                        }
+                        double ref_rms = std::sqrt(sumsq / (double) n_samples);
+                        if (ref_rms > 0.0 && ref_rms < 0.1) {
+                            float gain = (float) (0.1 / ref_rms);
+                            for (int i = 0; i < n_samples; i++) {
+                                ref_audio[i] *= gain;
+                            }
+                            fprintf(stderr, "[TTS] Reference: RMS %.4f -> 0.1 gain %.4f\n", ref_rms, gain);
+                        }
+                        // Mirror Python: truncate ref audio to a multiple of
+                        // hop_length before encode so the codec consumes the
+                        // exact same samples on both sides.
+                        int n_aligned = (n_samples / pc.hop_length) * pc.hop_length;
+                        fprintf(
+                            stderr, "[TTS] Reference: %s, %d samples @ 24 kHz mono (%.2f s), aligned to %d (clip %d)\n",
+                            ref_wav_path, n_samples, (double) n_samples / 24000.0, n_aligned, n_samples - n_aligned);
+                        if (dump_dir) {
+                            DebugDumper dbg;
+                            debug_init(&dbg, dump_dir);
+                            debug_dump_1d(&dbg, "ref-audio-24k", ref_audio, n_aligned);
+                        }
+                        ref_codes = pipeline_codec_encode(&pc, ref_audio, n_aligned, dump_dir);
                         free(ref_audio);
                         if (ref_codes.empty()) {
                             fprintf(stderr, "[CLI] ERROR: codec_encode failed on %s\n", ref_wav_path);
@@ -447,6 +530,12 @@ int main(int argc, char ** argv) {
                             } else {
                                 ref_T = (int) ref_codes.size() / K;
                                 fprintf(stderr, "[TTS] Reference: encoded to [K=%d, T=%d] codes\n", K, ref_T);
+                                if (dump_dir) {
+                                    DebugDumper dbg;
+                                    debug_init(&dbg, dump_dir);
+                                    int ref_shape[2] = { K, ref_T };
+                                    debug_dump_i32_as_f32(&dbg, "ref-audio-codes", ref_codes.data(), ref_shape, 2);
+                                }
                             }
                         }
                     }
@@ -457,19 +546,11 @@ int main(int argc, char ** argv) {
                 // Defaults mirror OmniVoiceGenerationConfig (Python) :
                 // num_step=32, guidance_scale=2.0, t_shift=0.1,
                 // layer_penalty_factor=5.0, position_temperature=5.0,
-                // class_temperature=0.0. The seed is plumbed from the CLI,
-                // and pos_temp / cls_temp can override the sampling defaults
-                // for bit comparison with a controlled Python reference.
+                // class_temperature=0.0. The seed is plumbed from the CLI.
                 MaskgitConfig mg_cfg      = {};
                 mg_cfg.seed               = seed_resolved;
                 mg_cfg.sm_count           = sm_count;
                 mg_cfg.max_threads_per_sm = max_threads_per_sm;
-                if (cli_pos_temp >= 0.0f) {
-                    mg_cfg.position_temperature = cli_pos_temp;
-                }
-                if (cli_cls_temp >= 0.0f) {
-                    mg_cfg.class_temperature = cli_cls_temp;
-                }
 
                 std::string text         = read_stdin_text();
                 std::string lang         = prompt_lang ? prompt_lang : "";

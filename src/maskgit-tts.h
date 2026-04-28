@@ -68,7 +68,9 @@ static std::vector<int> maskgit_schedule(int num_step, int total_mask, const std
 }
 
 // log_softmax(x) along the last dim of length V. log_probs[v] = x[v] - log(sum exp(x - max)).
-// Numerically stable form using the max trick.
+// FP32 accumulation matches PyTorch CUDA log_softmax. Going to FP64 here is
+// more accurate but diverges from the reference at positions where top-1 and
+// top-2 are within a few ULPs.
 static void maskgit_log_softmax_inplace(float * x, int V) {
     float m = x[0];
     for (int v = 1; v < V; v++) {
@@ -76,11 +78,11 @@ static void maskgit_log_softmax_inplace(float * x, int V) {
             m = x[v];
         }
     }
-    double sum = 0.0;
+    float sum = 0.0f;
     for (int v = 0; v < V; v++) {
-        sum += std::exp((double) (x[v] - m));
+        sum += std::exp(x[v] - m);
     }
-    float lse = m + (float) std::log(sum);
+    float lse = m + std::log(sum);
     for (int v = 0; v < V; v++) {
         x[v] = x[v] - lse;
     }
@@ -275,6 +277,18 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                 }
                 confidence[(size_t) k * T + t] = max_lp;
             }
+        }
+
+        // Dump pred_tokens and confidence at step 0 only, before the layer
+        // penalty so the dump matches Python _predict_tokens_with_scoring.
+        if (step == 0 && dump_dir) {
+            DebugDumper dbg;
+            debug_init(&dbg, dump_dir);
+            int kt_shape[2]  = { K, T };
+            int ktv_shape[3] = { K, T, V };
+            debug_dump_i32_as_f32(&dbg, "mg-pred-tokens-step0", pred_tokens.data(), kt_shape, 2);
+            debug_dump_2d(&dbg, "mg-scores-step0", confidence.data(), K, T);
+            debug_dump(&dbg, "mg-log-probs-step0", log_probs.data(), ktv_shape, 3);
         }
 
         // Apply layer penalty : scores -= k * layer_penalty_factor.

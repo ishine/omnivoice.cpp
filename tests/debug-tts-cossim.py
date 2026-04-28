@@ -153,11 +153,24 @@ def install_hooks(model, dump_dir):
 
     # First call to _predict_tokens_with_scoring corresponds to step 0 of the
     # MaskGIT loop. Capture cond and uncond logits in [K, T, V] layout (squeeze
-    # the batch axis to match the C++ dump shape).
+    # the batch axis to match the C++ dump shape). Replicate the predict math
+    # locally so log_probs / pred_tokens / scores can all be dumped from a
+    # single source of truth on the Python side.
     seen = {"step0": False}
     orig_pred = model._predict_tokens_with_scoring
     def hooked_pred(c_logits, u_logits, gen_config):
+        pred_tokens, scores = orig_pred(c_logits, u_logits, gen_config)
         if not seen["step0"]:
+            if gen_config.guidance_scale != 0:
+                c_lp = torch.nn.functional.log_softmax(c_logits, dim=-1)
+                u_lp = torch.nn.functional.log_softmax(u_logits, dim=-1)
+                log_probs = torch.log_softmax(
+                    c_lp + gen_config.guidance_scale * (c_lp - u_lp), dim=-1)
+            else:
+                log_probs = torch.nn.functional.log_softmax(c_logits, dim=-1)
+            log_probs = log_probs.clone()
+            log_probs[..., model.config.audio_mask_id] = float("-inf")
+
             c = c_logits.detach().to(torch.float32).cpu().numpy()
             u = u_logits.detach().to(torch.float32).cpu().numpy()
             if c.ndim == 4:
@@ -166,8 +179,22 @@ def install_hooks(model, dump_dir):
                 u = u[0]
             save_dump(os.path.join(dump_dir, "lm-logits-step0-cond.bin"),   c)
             save_dump(os.path.join(dump_dir, "lm-logits-step0-uncond.bin"), u)
+
+            lp_arr = log_probs.detach().to(torch.float32).cpu().numpy()
+            if lp_arr.ndim == 4:
+                lp_arr = lp_arr[0]
+            save_dump(os.path.join(dump_dir, "mg-log-probs-step0.bin"), lp_arr)
+
+            pt_arr = pred_tokens.detach().to(torch.float32).cpu().numpy()
+            sc_arr = scores.detach().to(torch.float32).cpu().numpy()
+            if pt_arr.ndim == 3:
+                pt_arr = pt_arr[0]
+            if sc_arr.ndim == 3:
+                sc_arr = sc_arr[0]
+            save_dump(os.path.join(dump_dir, "mg-pred-tokens-step0.bin"), pt_arr)
+            save_dump(os.path.join(dump_dir, "mg-scores-step0.bin"),      sc_arr)
             seen["step0"] = True
-        return orig_pred(c_logits, u_logits, gen_config)
+        return pred_tokens, scores
     model._predict_tokens_with_scoring = hooked_pred
 
     orig_generate = model._generate_iterative
@@ -203,10 +230,6 @@ def main():
     ap.add_argument("--instruct", default="male")
     ap.add_argument("--lang",     default="French")
     ap.add_argument("--duration", type=float, default=None)
-    ap.add_argument("--pos-temp", type=float, default=None,
-                    help="Override MaskGIT position_temperature on both sides (default 5.0)")
-    ap.add_argument("--cls-temp", type=float, default=None,
-                    help="Override MaskGIT class_temperature on both sides (default 0.0)")
     ap.add_argument("--out-cpp",  default="cpp/tts-cpp.wav")
     ap.add_argument("--out-pt",   default="python/tts-python.wav")
     args = ap.parse_args()
@@ -243,10 +266,6 @@ def main():
         postprocess_output=False,
         audio_chunk_threshold=1e9,
     )
-    if args.pos_temp is not None:
-        gen_kwargs["position_temperature"] = args.pos_temp
-    if args.cls_temp is not None:
-        gen_kwargs["class_temperature"] = args.cls_temp
     audios = model.generate(**gen_kwargs)
     audio_pt = np.asarray(audios[0], dtype=np.float32)
     sf.write(args.out_pt, audio_pt, 24000, subtype="FLOAT")
@@ -271,14 +290,11 @@ def main():
         "--format",      "wav32",
         "--dump",        DUMP_CPP,
         "--no-fa",
+        "--strict-f32",
         "-o",            args.out_cpp,
     ]
     if args.duration:
         cmd += ["--duration", str(args.duration)]
-    if args.pos_temp is not None:
-        cmd += ["--pos-temp", str(args.pos_temp)]
-    if args.cls_temp is not None:
-        cmd += ["--cls-temp", str(args.cls_temp)]
     print(f"[GGML] Cmd: {' '.join(cmd)}")
     r = subprocess.run(cmd, input=text, text=True)
     if r.returncode != 0:
@@ -323,10 +339,39 @@ def main():
         ("Final",  "lm-hidden-step0-{}.bin"),
         ("Logits", "lm-logits-step0-{}.bin"),
     ]
+    def metric(a, b):
+        n = min(a.size, b.size)
+        af = a.astype(np.float64).ravel()[:n]
+        bf = b.astype(np.float64).ravel()[:n]
+        d  = np.abs(af - bf)
+        nrm_a = float(np.linalg.norm(af))
+        nrm_b = float(np.linalg.norm(bf))
+        c = float(np.dot(af, bf) / (nrm_a * nrm_b)) if nrm_a > 1e-10 and nrm_b > 1e-10 else 0.0
+        return c, float(d.max()), float(d.mean())
+
     for label, fmt in stages:
         ca, cb = pair(fmt.format("cond"))
         ua, ub = pair(fmt.format("uncond"))
-        print(f"[Cossim] {label} cond: {cos(ca, cb):.6f} uncond: {cos(ua, ub):.6f}")
+        cc, cmax, cmean = metric(ca, cb)
+        uc, umax, umean = metric(ua, ub)
+        print(f"[Cossim] {label} cond cos: {cc:.6f} max: {cmax:.4e} mean: {cmean:.4e} uncond cos: {uc:.6f} max: {umax:.4e} mean: {umean:.4e}")
+
+    pa, pb = pair("mg-pred-tokens-step0.bin")
+    n = min(pa.size, pb.size)
+    ai = pa.astype(np.int64).ravel()[:n]
+    bi = pb.astype(np.int64).ravel()[:n]
+    diffs = np.where(ai != bi)[0]
+    print(f"[Cossim] Step0Tokens exact: {100.0 * float((ai == bi).mean()):.2f}% diffs: {diffs.size}")
+
+    sa, sb = pair("mg-scores-step0.bin")
+    sd = np.abs(sa - sb)
+    print(f"[Cossim] Step0Scores cos: {cos(sa, sb):.6f} max_abs_diff: {sd.max():.6f} mean_abs_diff: {sd.mean():.6f}")
+
+    la, lb = pair("mg-log-probs-step0.bin")
+    finite = np.isfinite(la) & np.isfinite(lb)
+    laf = la[finite]; lbf = lb[finite]
+    ld = np.abs(laf - lbf)
+    print(f"[Cossim] Step0LogProbs cos: {cos(laf, lbf):.6f} max_abs_diff: {ld.max():.6f} mean_abs_diff: {ld.mean():.6f}")
 
     ta, tb = pair("mg-tokens.bin")
     n = min(ta.size, tb.size)

@@ -200,27 +200,42 @@ static struct ggml_tensor * qwen3_build_mlp(struct ggml_context * ctx,
 }
 
 // Single layer: input [H, S] -> output [H, S]
-static struct ggml_tensor * qwen3_build_layer(struct ggml_context * ctx,
-                                              const Qwen3Config &   c,
-                                              Qwen3Layer *          ly,
-                                              struct ggml_tensor *  hidden,
-                                              struct ggml_tensor *  positions,
-                                              struct ggml_tensor *  mask,
-                                              int                   S,
-                                              bool                  use_flash_attn = true,
-                                              bool                  clamp_fp16     = false) {
+// When sub_outs is non null, the layer pushes (norm1, attn, norm2, mlp) for
+// post inspection. Sub tensors are pre residual outputs of each sub-module.
+static struct ggml_tensor * qwen3_build_layer(struct ggml_context *               ctx,
+                                              const Qwen3Config &                 c,
+                                              Qwen3Layer *                        ly,
+                                              struct ggml_tensor *                hidden,
+                                              struct ggml_tensor *                positions,
+                                              struct ggml_tensor *                mask,
+                                              int                                 S,
+                                              bool                                use_flash_attn = true,
+                                              bool                                clamp_fp16     = false,
+                                              std::vector<struct ggml_tensor *> * sub_outs       = nullptr) {
     // Self-attention block
     struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
+    if (sub_outs) {
+        sub_outs->push_back(norm);
+    }
     struct ggml_tensor * attn = qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16);
-    hidden                    = ggml_add(ctx, hidden, attn);
+    if (sub_outs) {
+        sub_outs->push_back(attn);
+    }
+    hidden = ggml_add(ctx, hidden, attn);
     if (clamp_fp16) {
         hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
     }
 
     // MLP block
-    norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
+    norm = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
+    if (sub_outs) {
+        sub_outs->push_back(norm);
+    }
     struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, S);
-    hidden                   = ggml_add(ctx, hidden, mlp);
+    if (sub_outs) {
+        sub_outs->push_back(mlp);
+    }
+    hidden = ggml_add(ctx, hidden, mlp);
     if (clamp_fp16) {
         hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
     }
@@ -244,9 +259,13 @@ static struct ggml_tensor * qwen3_build_layers(struct ggml_context *            
                                                bool                                use_flash_attn       = true,
                                                bool                                clamp_fp16           = false,
                                                const std::vector<int> *            intermediate_indices = nullptr,
-                                               std::vector<struct ggml_tensor *> * intermediates        = nullptr) {
+                                               std::vector<struct ggml_tensor *> * intermediates        = nullptr,
+                                               int                                 dump_sub_layer       = -1,
+                                               std::vector<struct ggml_tensor *> * sub_outs             = nullptr) {
     for (int i = 0; i < c.n_layers; i++) {
-        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn, clamp_fp16);
+        std::vector<struct ggml_tensor *> * subs_for_this = (i == dump_sub_layer) ? sub_outs : nullptr;
+        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn, clamp_fp16,
+                                   subs_for_this);
         if (intermediate_indices && intermediates) {
             for (int idx : *intermediate_indices) {
                 if (idx == i) {

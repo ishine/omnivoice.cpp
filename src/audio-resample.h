@@ -1,105 +1,137 @@
 #pragma once
-// audio-resample.h: polyphase sample rate conversion via pre-computed
-// Kaiser-windowed sinc filter. No external dependencies.
-// Part of acestep.cpp. MIT license.
+// audio-resample.h: torchaudio.functional.resample compatible reimplementation.
+// Hann-windowed sinc interpolation with rolloff=0.99 and lowpass_filter_width=6,
+// matching torchaudio defaults bit for bit.
+//
+// Reference: torchaudio/functional/functional.py, _get_sinc_resample_kernel
+// and _apply_sinc_resample_kernel.
+//
+// Algorithm:
+//   gcd                 = gcd(sr_in, sr_out)
+//   orig                = sr_in / gcd
+//   new                 = sr_out / gcd
+//   base                = min(orig, new) * rolloff
+//   width               = ceil(lpfw * orig / base)
+//   kernel_size         = 2 * width + orig
+//   kernel[j, k]        = sinc(t * pi) * hann(t)^2 * (base / orig)
+//                          with t = clamp(((k - width) / orig - j / new) * base,
+//                                         -lpfw, lpfw)
+//   target_length       = ceil(sr_out * n_in / sr_in)
+//
+// Apply: pad (width, width + orig), strided conv1d, transpose, truncate.
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifndef M_PI
 #    define M_PI 3.14159265358979323846
 #endif
 
-// Polyphase resampler with pre-computed Kaiser-windowed sinc filter.
-//
-// Instead of computing bessel_i0 + sqrt + sin per output sample (O(N_out * N_taps)),
-// we build a polyphase table once: table[phase][tap] = sinc(d) * kaiser(d).
-// The hot loop is then just a table lookup + dot product -- no transcendentals.
-//
-// Table size: 256 phases * 64 taps * 4 bytes = 64 KB (fits L1 cache).
+#define AUDIO_RESAMPLE_LPFW    6
+#define AUDIO_RESAMPLE_ROLLOFF 0.99
 
-#define RESAMPLE_N_TAPS   64
-#define RESAMPLE_N_PHASES 256
-#define RESAMPLE_HALF_LEN (RESAMPLE_N_TAPS / 2)
-
-// Bessel I0 via Taylor series. Only used during table construction
-// (called RESAMPLE_N_PHASES * RESAMPLE_N_TAPS = 16384 times total, not millions).
-static double audio_resample_bessel_i0(double x) {
-    double sum  = 1.0;
-    double term = 1.0;
-    double y    = x * x * 0.25;
-    for (int k = 1; k < 30; k++) {
-        term *= y / ((double) k * (double) k);
-        sum += term;
-        if (term < sum * 1e-15) {
-            break;
-        }
+static int audio_resample_gcd(int a, int b) {
+    while (b != 0) {
+        int t = b;
+        b     = a % b;
+        a     = t;
     }
-    return sum;
+    return a;
 }
 
-// Build polyphase filter bank.
-//
-// For output sample i at position center = i / ratio in input space:
-//   center_int = floor(center), frac = center - center_int
-//   phase = frac * N_PHASES
-//   base  = center_int - HALF_LEN + 1
-//   for tap 0..N_TAPS-1: h = table[phase][tap], input = src[base + tap]
-//
-// d (distance from center to tap) = frac + HALF_LEN - 1 - tap
-// This depends only on phase and tap, so we can pre-compute everything.
-static void audio_resample_build_table(float table[][RESAMPLE_N_TAPS], double fc, double beta) {
-    double inv_i0b = 1.0 / audio_resample_bessel_i0(beta);
+// Build the Hann-sinc polyphase kernel [new_freq_red, kernel_size] in row major.
+// new_freq_red and orig_freq_red are sr_out/gcd and sr_in/gcd respectively.
+static std::vector<float> audio_resample_build_kernel(int orig, int newf, int * out_width, int * out_kernel_size) {
+    int    base_int = (orig < newf) ? orig : newf;
+    double base     = (double) base_int * AUDIO_RESAMPLE_ROLLOFF;
+    int    width    = (int) std::ceil((double) AUDIO_RESAMPLE_LPFW * (double) orig / base);
+    int    K        = 2 * width + orig;
 
-    for (int p = 0; p < RESAMPLE_N_PHASES; p++) {
-        double frac = (double) p / (double) RESAMPLE_N_PHASES;
+    std::vector<float> ker((size_t) newf * (size_t) K);
 
-        for (int tap = 0; tap < RESAMPLE_N_TAPS; tap++) {
-            double d = frac + (double) (RESAMPLE_HALF_LEN - 1 - tap);
+    double scale = base / (double) orig;
+    double inv_o = 1.0 / (double) orig;
+    double inv_n = 1.0 / (double) newf;
+    double pi    = M_PI;
 
-            // windowed sinc
-            double sinc_val;
-            if (fabs(d) < 1e-9) {
-                sinc_val = 2.0 * fc;
-            } else {
-                sinc_val = sin(2.0 * M_PI * fc * d) / (M_PI * d);
+    for (int j = 0; j < newf; j++) {
+        double t_off = (double) (-j) * inv_n;
+        for (int k = 0; k < K; k++) {
+            double idx_k = (double) (k - width) * inv_o;
+            double t     = (t_off + idx_k) * base;
+            if (t < -AUDIO_RESAMPLE_LPFW) {
+                t = -AUDIO_RESAMPLE_LPFW;
+            }
+            if (t > AUDIO_RESAMPLE_LPFW) {
+                t = AUDIO_RESAMPLE_LPFW;
             }
 
-            // Kaiser window
-            double t = d / (double) RESAMPLE_HALF_LEN;
-            double win;
-            if (t < -1.0 || t > 1.0) {
-                win = 0.0;
-            } else {
-                win = audio_resample_bessel_i0(beta * sqrt(1.0 - t * t)) * inv_i0b;
-            }
+            double w = std::cos(t * pi / (double) AUDIO_RESAMPLE_LPFW / 2.0);
+            w        = w * w;
 
-            table[p][tap] = (float) (sinc_val * win);
+            double tp   = t * pi;
+            double sinc = (tp == 0.0) ? 1.0 : std::sin(tp) / tp;
+
+            ker[(size_t) j * (size_t) K + (size_t) k] = (float) (sinc * w * scale);
         }
+    }
+
+    *out_width       = width;
+    *out_kernel_size = K;
+    return ker;
+}
+
+// Resample one mono channel from sr_in to sr_out. Returns ceil(sr_out*n_in/sr_in)
+// samples. Caller passes the kernel + width built once via audio_resample_build_kernel.
+static void audio_resample_apply_mono(const float * in,
+                                      int           n_in,
+                                      int           orig,
+                                      int           newf,
+                                      int           width,
+                                      int           kernel_size,
+                                      const float * kernel,
+                                      float *       out,
+                                      long long     target_length) {
+    int                K  = kernel_size;
+    int                Np = n_in + 2 * width + orig;
+    std::vector<float> padded((size_t) Np, 0.0f);
+    std::memcpy(padded.data() + width, in, (size_t) n_in * sizeof(float));
+
+    int       n_per_chan = (Np - K) / orig + 1;
+    long long total      = (long long) n_per_chan * (long long) newf;
+    long long out_len    = (target_length < total) ? target_length : total;
+
+    for (long long t_out = 0; t_out < out_len; t_out++) {
+        int           chan = (int) (t_out % (long long) newf);
+        int           pos  = (int) (t_out / (long long) newf);
+        const float * w    = kernel + (size_t) chan * (size_t) K;
+        const float * x    = padded.data() + (size_t) pos * (size_t) orig;
+        float         sum  = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += x[k] * w[k];
+        }
+        out[(size_t) t_out] = sum;
     }
 }
 
-// Resample a planar float audio buffer from sr_in to sr_out.
+// Public API: resample a planar (or mono) f32 buffer from sr_in to sr_out.
+// in:     float buffer with channels stored planar [ch0: n_in][ch1: n_in][...].
+// n_in:   per-channel input sample count.
+// nch:    number of channels.
+// n_out:  receives the per-channel output sample count.
 //
-// in:     planar float [ch0: n_in samples][ch1: n_in samples][...]
-// n_in:   samples per channel in the input
-// sr_in:  input sample rate (e.g. 44100)
-// sr_out: output sample rate (e.g. 48000)
-// nch:    number of channels (1 or 2)
-// n_out:  receives the output sample count per channel
-//
-// Returns a malloc'd planar buffer [ch0: n_out][ch1: n_out][...].
-// Caller must free() the result.
-// Returns NULL on error (bad sr, alloc failure).
+// Returns a malloc'd planar buffer [ch0: *n_out][ch1: *n_out][...].
+// Caller must free() the result. NULL on error.
 static float * audio_resample(const float * in, int n_in, int sr_in, int sr_out, int nch, int * n_out) {
     if (!in || n_in <= 0 || sr_in <= 0 || sr_out <= 0 || nch <= 0) {
         *n_out = 0;
         return NULL;
     }
 
-    // passthrough: no conversion needed
+    // Passthrough when source and target rates match.
     if (sr_in == sr_out) {
         size_t  sz  = (size_t) n_in * (size_t) nch * sizeof(float);
         float * out = (float *) malloc(sz);
@@ -113,88 +145,33 @@ static float * audio_resample(const float * in, int n_in, int sr_in, int sr_out,
         return out;
     }
 
-    double ratio = (double) sr_out / (double) sr_in;
-    *n_out       = (int) ((double) n_in * ratio);
-    if (*n_out <= 0) {
+    int g    = audio_resample_gcd(sr_in, sr_out);
+    int orig = sr_in / g;
+    int newf = sr_out / g;
+
+    int                width = 0, kernel_size = 0;
+    std::vector<float> kernel = audio_resample_build_kernel(orig, newf, &width, &kernel_size);
+
+    long long target = (long long) std::ceil((double) sr_out * (double) n_in / (double) sr_in);
+    if (target <= 0) {
         *n_out = 0;
         return NULL;
     }
 
-    float * out = (float *) malloc((size_t) (*n_out) * (size_t) nch * sizeof(float));
+    *n_out = (int) target;
+
+    float * out = (float *) malloc((size_t) target * (size_t) nch * sizeof(float));
     if (!out) {
+        fprintf(stderr, "[Audio-Resample] OOM output buffer\n");
         *n_out = 0;
         return NULL;
     }
-
-    // Kaiser window parameter (beta=9.0 gives ~80 dB stopband)
-    double beta = 9.0;
-
-    // cutoff: lowpass at the lower of the two rates to prevent aliasing
-    double fc = 0.5 * ((ratio < 1.0) ? ratio : 1.0);
-
-    // build polyphase filter table (one-time cost: ~16K coeff, microseconds)
-    float(*table)[RESAMPLE_N_TAPS] =
-        (float(*)[RESAMPLE_N_TAPS]) malloc(RESAMPLE_N_PHASES * RESAMPLE_N_TAPS * sizeof(float));
-    if (!table) {
-        free(out);
-        *n_out = 0;
-        return NULL;
-    }
-    audio_resample_build_table(table, fc, beta);
-
-    float ratio_f   = (float) ratio;
-    float inv_ratio = 1.0f / ratio_f;
 
     for (int ch = 0; ch < nch; ch++) {
-        const float * src = in + ch * n_in;
-        float *       dst = out + ch * (*n_out);
-
-        for (int i = 0; i < *n_out; i++) {
-            // position in input sample space
-            float center   = (float) i * inv_ratio;
-            int   center_i = (int) floorf(center);
-            float frac     = center - (float) center_i;
-
-            // phase index + interpolation fraction between adjacent phases
-            float phase_f   = frac * (float) RESAMPLE_N_PHASES;
-            int   phase     = (int) phase_f;
-            float phase_mix = phase_f - (float) phase;
-            if (phase >= RESAMPLE_N_PHASES - 1) {
-                phase     = RESAMPLE_N_PHASES - 2;
-                phase_mix = 1.0f;
-            }
-
-            int base = center_i - RESAMPLE_HALF_LEN + 1;
-
-            // dot product with linear interpolation between adjacent phases
-            // (avoids quantization artifacts from 256 discrete phases)
-            const float * h0 = table[phase];
-            const float * h1 = table[phase + 1];
-
-            float sum = 0.0f;
-            float wgt = 0.0f;
-
-            for (int tap = 0; tap < RESAMPLE_N_TAPS; tap++) {
-                float h = h0[tap] + phase_mix * (h1[tap] - h0[tap]);
-
-                // clamp to input bounds (repeat edge samples)
-                int idx = base + tap;
-                if (idx < 0) {
-                    idx = 0;
-                }
-                if (idx >= n_in) {
-                    idx = n_in - 1;
-                }
-
-                sum += src[idx] * h;
-                wgt += h;
-            }
-
-            // normalize to compensate for edge effects
-            dst[i] = (wgt > 1e-12f) ? sum / wgt : 0.0f;
-        }
+        const float * src = in + (size_t) ch * (size_t) n_in;
+        float *       dst = out + (size_t) ch * (size_t) target;
+        audio_resample_apply_mono(src, n_in, orig, newf, width, kernel_size, kernel.data(), dst, target);
     }
 
-    free(table);
     return out;
 }

@@ -104,6 +104,8 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
     // scores : allowed positions get a +1.0 boost, blocked positions stay at
     // 0.0. This is not a hard mask : every position still contributes to the
     // softmax, the model was trained against this exact bias semantics.
+    // F16 is the type expected by ggml_flash_attn_ext, and 1.0 / 0.0 are
+    // representable exactly in F16 so there is no precision loss.
     std::vector<uint16_t> attn_f16;
     if (attention_mask) {
         attn_f16.resize((size_t) S * (size_t) S);
@@ -174,17 +176,22 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
     // origin of any drift layer by layer.
     std::vector<int>                  dump_layer_indices;
     std::vector<struct ggml_tensor *> dump_intermediates;
+    std::vector<struct ggml_tensor *> sub_outs;
     if (dump_hidden_dir && dump_hidden_name) {
-        dump_layer_indices = { 0, 6, 13, 20 };
+        dump_layer_indices = { 0, 1, 2, 3, 4, 5, 6, 13, 14, 15, 16, 17, 18, 19, 20 };
         ggml_set_name(inputs_embeds, "lm_inputs_embeds");
         ggml_set_output(inputs_embeds);
     }
     struct ggml_tensor * hidden = qwen3_build_layers(
         gctx, cfg, pt->lm.layers, pt->lm.final_norm, inputs_embeds, t_positions, t_attn, S, pt->use_flash_attn,
         pt->clamp_fp16, dump_hidden_dir && dump_hidden_name ? &dump_layer_indices : nullptr,
-        dump_hidden_dir && dump_hidden_name ? &dump_intermediates : nullptr);
+        dump_hidden_dir && dump_hidden_name ? &dump_intermediates : nullptr,
+        dump_hidden_dir && dump_hidden_name ? 1 : -1, dump_hidden_dir && dump_hidden_name ? &sub_outs : nullptr);
     if (dump_hidden_dir && dump_hidden_name) {
         for (struct ggml_tensor * t : dump_intermediates) {
+            ggml_set_output(t);
+        }
+        for (struct ggml_tensor * t : sub_outs) {
             ggml_set_output(t);
         }
         ggml_set_name(hidden, "lm_last_hidden");
@@ -259,6 +266,12 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
             char suffix[32];
             snprintf(suffix, sizeof(suffix), "-l%d", dump_layer_indices[i]);
             dump_tensor_2d(dump_intermediates[i], std::string(dump_hidden_name) + suffix);
+        }
+
+        // Layer 1 sub-module taps : norm1, attn (pre residual), norm2, mlp (pre residual).
+        const char * sub_names[4] = { "-l1-norm1", "-l1-attn", "-l1-norm2", "-l1-mlp" };
+        for (size_t i = 0; i < sub_outs.size() && i < 4; i++) {
+            dump_tensor_2d(sub_outs[i], std::string(dump_hidden_name) + sub_names[i]);
         }
 
         // Final hidden, post output norm, pre lm_head.

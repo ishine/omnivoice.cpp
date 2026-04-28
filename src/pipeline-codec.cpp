@@ -19,6 +19,7 @@
 #include "pipeline-codec.h"
 
 #include "audio-resample.h"
+#include "debug.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -337,7 +338,10 @@ static std::vector<float> pipeline_codec_hubert_features_test(PipelineCodec * pc
 static std::vector<float> pipeline_codec_sem_enc_test(PipelineCodec * pc, const float * features_f32, int n_frames);
 static std::vector<float> pipeline_codec_dac_enc_test(PipelineCodec * pc, const float * audio_f32, int n_samples);
 
-std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * audio_24k, int n_samples) {
+std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
+                                           const float *   audio_24k,
+                                           int             n_samples,
+                                           const char *    dump_dir) {
     if (n_samples <= 0) {
         return {};
     }
@@ -350,6 +354,11 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
         free(resampled);
         return {};
     }
+    if (dump_dir) {
+        DebugDumper dbg;
+        debug_init(&dbg, dump_dir);
+        debug_dump_1d(&dbg, "ref-audio-16k", resampled, n_16k);
+    }
     const int          n_padded = n_16k + 320;
     std::vector<float> audio_16k_padded((size_t) n_padded, 0.0f);
     std::memcpy(audio_16k_padded.data() + 160, resampled, (size_t) n_16k * sizeof(float));
@@ -361,6 +370,12 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
         return {};
     }
     const int T_s = (int) (features.size() / 768);
+
+    if (dump_dir) {
+        DebugDumper dbg;
+        debug_init(&dbg, dump_dir);
+        debug_dump_2d(&dbg, "ref-hubert-features", features.data(), T_s, 768);
+    }
 
     // hubert_features returns ne=(768, T_s) with K fast (768 axis). sem_enc
     // graph input expects ne=(T_s, 768) with T fast (dac_conv1d layout, mirror

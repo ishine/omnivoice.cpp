@@ -76,7 +76,12 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
 //   fc Linear (1024 -> 1024)           -> projected        (1024, T)
 //   RVQ encode loop                    -> codes            (CB=8, T) i32
 // Returns codes flat in (CB, T) row-major, empty on failure.
-std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * audio_24k, int n_samples);
+// dump_dir : when non null, writes ref-audio-16k and ref-hubert-features
+// debug binaries into that directory. Pass NULL to skip.
+std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
+                                           const float *   audio_24k,
+                                           int             n_samples,
+                                           const char *    dump_dir = NULL);
 
 // Free all backend buffers and GGML contexts. Safe to call on a zeroed struct.
 void pipeline_codec_free(PipelineCodec * pc);
