@@ -170,7 +170,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
     // Cache the inputs that stay constant across the 32 MaskGIT steps. The
     // attention mask in particular is heavy to convert to F16 (~9 ms on the
-    // typical voice cloning shape) and was being rebuilt every step.
+    // typical voice cloning shape), so building it once amortizes the cost.
     MaskgitBatchedCtx batched_ctx;
     pipeline_tts_llm_batched_ctx_init(&batched_ctx, prompt->audio_mask.data(), prompt->attention_mask.data(), B_prime,
                                       S);
