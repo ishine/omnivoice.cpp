@@ -72,8 +72,8 @@ static bool dac_enc_load(DACEncoder * d, const GGUFModel & gf, ggml_backend_t ba
     d->weight_ctx                         = ggml_init(p);
     struct ggml_context * ctx             = d->weight_ctx;
 
-    // 1 -> 64 conv1, dtype mirrors the GGUF source (F32 or BF16)
-    d->c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "acoustic_encoder.conv1.weight"), 7, 1, 64);
+    // 1 -> 64 conv1, F16 mandatory for ARM im2col strict assertion
+    d->c1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, 1, 64);
     d->c1b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
 
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
@@ -93,22 +93,22 @@ static bool dac_enc_load(DACEncoder * d, const GGUFModel & gf, ggml_backend_t ba
             ru.dilation     = dilations[r];
             std::string rp  = pfx + ".res_unit" + std::to_string(r + 1);
             dac_alloc_snake(ctx, &ru.s1, b.in_ch);
-            ru.c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv1.weight"), 7, b.in_ch, b.in_ch);
+            ru.c1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, b.in_ch, b.in_ch);
             ru.c1b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.in_ch);
             dac_alloc_snake(ctx, &ru.s2, b.in_ch);
-            ru.c2w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv2.weight"), 1, b.in_ch, b.in_ch);
+            ru.c2w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, b.in_ch, b.in_ch);
             ru.c2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.in_ch);
         }
 
         // Post-residual snake then downsampling conv (in_ch -> out_ch).
         dac_alloc_snake(ctx, &b.s_post, b.in_ch);
-        b.cw = ggml_new_tensor_3d(ctx, gf_get_type(gf, pfx + ".conv1.weight"), b.kernel, b.in_ch, b.out_ch);
+        b.cw = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, b.kernel, b.in_ch, b.out_ch);
         b.cb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
     }
 
     // Final snake on 2048 channels then conv2 (2048 -> 256, k=3).
     dac_alloc_snake(ctx, &d->s_final, 2048);
-    d->c2w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "acoustic_encoder.conv2.weight"), 3, 2048, 256);
+    d->c2w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 3, 2048, 256);
     d->c2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
 
     // Phase 2 : allocate backend buffer for all tensors at once.
@@ -120,7 +120,7 @@ static bool dac_enc_load(DACEncoder * d, const GGUFModel & gf, ggml_backend_t ba
     ggml_backend_buffer_set_usage(d->weight_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // Phase 3 : copy data with per-tensor transforms (snake reciprocal, F32 cast).
-    dac_load_passthrough(d->c1w, gf, "acoustic_encoder.conv1.weight");
+    gf_load_conv_f16(d->c1w, gf, "acoustic_encoder.conv1.weight");
     dac_load_bias_f32(d->c1b, gf, "acoustic_encoder.conv1.bias");
 
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
@@ -130,19 +130,19 @@ static bool dac_enc_load(DACEncoder * d, const GGUFModel & gf, ggml_backend_t ba
             DACResUnit & ru = b.ru[r];
             std::string  rp = pfx + ".res_unit" + std::to_string(r + 1);
             dac_load_snake(&ru.s1, gf, rp + ".snake1.alpha");
-            dac_load_passthrough(ru.c1w, gf, rp + ".conv1.weight");
+            gf_load_conv_f16(ru.c1w, gf, rp + ".conv1.weight");
             dac_load_bias_f32(ru.c1b, gf, rp + ".conv1.bias");
             dac_load_snake(&ru.s2, gf, rp + ".snake2.alpha");
-            dac_load_passthrough(ru.c2w, gf, rp + ".conv2.weight");
+            gf_load_conv_f16(ru.c2w, gf, rp + ".conv2.weight");
             dac_load_bias_f32(ru.c2b, gf, rp + ".conv2.bias");
         }
         dac_load_snake(&b.s_post, gf, pfx + ".snake1.alpha");
-        dac_load_passthrough(b.cw, gf, pfx + ".conv1.weight");
+        gf_load_conv_f16(b.cw, gf, pfx + ".conv1.weight");
         dac_load_bias_f32(b.cb, gf, pfx + ".conv1.bias");
     }
 
     dac_load_snake(&d->s_final, gf, "acoustic_encoder.snake1.alpha");
-    dac_load_passthrough(d->c2w, gf, "acoustic_encoder.conv2.weight");
+    gf_load_conv_f16(d->c2w, gf, "acoustic_encoder.conv2.weight");
     dac_load_bias_f32(d->c2b, gf, "acoustic_encoder.conv2.bias");
 
     fprintf(stderr, "[DAC-Enc] Loaded: 5 blocks, downsample %dx (8*5*4*2*3), 24 kHz mono in, weights %.1f MB\n",

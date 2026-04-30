@@ -22,7 +22,7 @@
 // Input / output : [T, 768] f32 in GGML layout (T fast, 768 slow), matching
 // what dac_conv1d expects so the DAC helpers can be reused as-is.
 
-#include "dac-decoder.h"  // for dac_conv1d, dac_load_passthrough, dac_load_bias_f32
+#include "dac-decoder.h"  // for dac_conv1d, dac_load_bias_f32
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
@@ -73,8 +73,8 @@ static bool sem_enc_load(SemanticEncoder * d, const GGUFModel & gf, ggml_backend
     d->weight_ctx                         = ggml_init(p);
     struct ggml_context * ctx             = d->weight_ctx;
 
-    // Initial 768 -> 768 conv, dtype mirrors the GGUF source (F32 or BF16)
-    d->c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "encoder_semantic.conv.weight"), 3, SEM_HIDDEN, SEM_HIDDEN);
+    // Initial 768 -> 768 conv, F16 mandatory for ARM im2col strict assertion
+    d->c1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 3, SEM_HIDDEN, SEM_HIDDEN);
 
     for (int i = 0; i < SEM_NUM_BLOCKS; i++) {
         SemanticEncBlock & b   = d->blk[i];
@@ -83,10 +83,10 @@ static bool sem_enc_load(SemanticEncoder * d, const GGUFModel & gf, ggml_backend
             SemanticResUnit & ru = b.ru[r];
             ru.dilation          = dilations[r];
             std::string rp       = pfx + ".res_units." + std::to_string(r);
-            ru.c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv1.weight"), 3, SEM_HIDDEN, SEM_HIDDEN);
-            ru.c2w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv2.weight"), 1, SEM_HIDDEN, SEM_HIDDEN);
+            ru.c1w               = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 3, SEM_HIDDEN, SEM_HIDDEN);
+            ru.c2w               = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, SEM_HIDDEN, SEM_HIDDEN);
         }
-        b.cw = ggml_new_tensor_3d(ctx, gf_get_type(gf, pfx + ".conv.weight"), 3, SEM_HIDDEN, SEM_HIDDEN);
+        b.cw = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 3, SEM_HIDDEN, SEM_HIDDEN);
         b.cb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, SEM_HIDDEN);
     }
 
@@ -99,7 +99,7 @@ static bool sem_enc_load(SemanticEncoder * d, const GGUFModel & gf, ggml_backend
     ggml_backend_buffer_set_usage(d->weight_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // Phase 3 : fill (passthrough bf16 + F32 cast for biases)
-    dac_load_passthrough(d->c1w, gf, "encoder_semantic.conv.weight");
+    gf_load_conv_f16(d->c1w, gf, "encoder_semantic.conv.weight");
 
     for (int i = 0; i < SEM_NUM_BLOCKS; i++) {
         SemanticEncBlock & b   = d->blk[i];
@@ -107,10 +107,10 @@ static bool sem_enc_load(SemanticEncoder * d, const GGUFModel & gf, ggml_backend
         for (int r = 0; r < SEM_RES_UNITS; r++) {
             SemanticResUnit & ru = b.ru[r];
             std::string       rp = pfx + ".res_units." + std::to_string(r);
-            dac_load_passthrough(ru.c1w, gf, rp + ".conv1.weight");
-            dac_load_passthrough(ru.c2w, gf, rp + ".conv2.weight");
+            gf_load_conv_f16(ru.c1w, gf, rp + ".conv1.weight");
+            gf_load_conv_f16(ru.c2w, gf, rp + ".conv2.weight");
         }
-        dac_load_passthrough(b.cw, gf, pfx + ".conv.weight");
+        gf_load_conv_f16(b.cw, gf, pfx + ".conv.weight");
         dac_load_bias_f32(b.cb, gf, pfx + ".conv.bias");
     }
 

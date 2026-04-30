@@ -201,8 +201,8 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
     d->weight_ctx                         = ggml_init(p);
     struct ggml_context * ctx             = d->weight_ctx;
 
-    // 256 -> 1024 conv1, dtype mirrors the GGUF source (F32 or BF16)
-    d->c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "acoustic_decoder.conv1.weight"), 7, 256, 1024);
+    // 256 -> 1024 conv1, F16 mandatory for ARM im2col strict assertion
+    d->c1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, 256, 1024);
     d->c1b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
 
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
@@ -224,16 +224,16 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
             ru.dilation     = dilations[r];
             std::string rp  = pfx + ".res_unit" + std::to_string(r + 1);
             dac_alloc_snake(ctx, &ru.s1, b.out_ch);
-            ru.c1w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv1.weight"), 7, b.out_ch, b.out_ch);
+            ru.c1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, b.out_ch, b.out_ch);
             ru.c1b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
             dac_alloc_snake(ctx, &ru.s2, b.out_ch);
-            ru.c2w = ggml_new_tensor_3d(ctx, gf_get_type(gf, rp + ".conv2.weight"), 1, b.out_ch, b.out_ch);
+            ru.c2w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 1, b.out_ch, b.out_ch);
             ru.c2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
         }
     }
 
     dac_alloc_snake(ctx, &d->s_final, DAC_FINAL_CH);
-    d->c2w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "acoustic_decoder.conv2.weight"), 7, DAC_FINAL_CH, 1);
+    d->c2w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 7, DAC_FINAL_CH, 1);
     d->c2b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 
     // Phase 2 : allocate backend buffer for all tensors at once
@@ -246,7 +246,7 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
 
     // Phase 3 : copy data from the GGUF mapping into the freshly-allocated
     // tensors, with per-tensor transforms (snake reciprocal, ctw permutation).
-    dac_load_passthrough(d->c1w, gf, "acoustic_decoder.conv1.weight");
+    gf_load_conv_f16(d->c1w, gf, "acoustic_decoder.conv1.weight");
     dac_load_bias_f32(d->c1b, gf, "acoustic_decoder.conv1.bias");
 
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
@@ -259,16 +259,16 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
             DACResUnit & ru = b.ru[r];
             std::string  rp = pfx + ".res_unit" + std::to_string(r + 1);
             dac_load_snake(&ru.s1, gf, rp + ".snake1.alpha");
-            dac_load_passthrough(ru.c1w, gf, rp + ".conv1.weight");
+            gf_load_conv_f16(ru.c1w, gf, rp + ".conv1.weight");
             dac_load_bias_f32(ru.c1b, gf, rp + ".conv1.bias");
             dac_load_snake(&ru.s2, gf, rp + ".snake2.alpha");
-            dac_load_passthrough(ru.c2w, gf, rp + ".conv2.weight");
+            gf_load_conv_f16(ru.c2w, gf, rp + ".conv2.weight");
             dac_load_bias_f32(ru.c2b, gf, rp + ".conv2.bias");
         }
     }
 
     dac_load_snake(&d->s_final, gf, "acoustic_decoder.snake1.alpha");
-    dac_load_passthrough(d->c2w, gf, "acoustic_decoder.conv2.weight");
+    gf_load_conv_f16(d->c2w, gf, "acoustic_decoder.conv2.weight");
     dac_load_bias_f32(d->c2b, gf, "acoustic_decoder.conv2.bias");
 
     fprintf(stderr, "[DAC] Loaded: 5 blocks, upsample %dx (8*5*4*2*3), 24 kHz mono out, weights %.1f MB\n",

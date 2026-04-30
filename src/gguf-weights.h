@@ -18,7 +18,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #    define NOMINMAX
@@ -286,6 +288,53 @@ static enum ggml_type gf_get_type(const GGUFModel & gf, const std::string & name
         exit(1);
     }
     return src->type;
+}
+
+// Load a Conv1d weight onto an F16 backend tensor regardless of the source
+// dtype. Mandatory on ARM aarch64 : the CPU im2col op asserts src0 is F16,
+// while x86 silently accepts BF16 / F32. F16 source memcpy passes through ;
+// F32 / BF16 widen ; Q8_0 / Q4_K / Q5_K / Q6_K dequantize via type traits.
+// The destination tensor must be allocated as GGML_TYPE_F16.
+static void gf_load_conv_f16(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
+    struct ggml_tensor * src = ggml_get_tensor(gf.meta, name.c_str());
+    if (!src) {
+        fprintf(stderr, "[GGUF] FATAL: tensor '%s' not in meta context\n", name.c_str());
+        exit(1);
+    }
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src));
+
+    const void * raw = gf_get_data(gf, name.c_str());
+    size_t       n   = (size_t) ggml_nelements(src);
+
+    // F16 source : direct memcpy, no conversion needed.
+    if (src->type == GGML_TYPE_F16) {
+        ggml_backend_tensor_set(dst, raw, 0, ggml_nbytes(dst));
+        return;
+    }
+
+    // All other types widen / dequantize to F32, then cast down to F16.
+    std::vector<float> f32(n);
+    if (src->type == GGML_TYPE_F32) {
+        memcpy(f32.data(), raw, n * sizeof(float));
+    } else if (src->type == GGML_TYPE_BF16) {
+        const uint16_t * p = (const uint16_t *) raw;
+        for (size_t i = 0; i < n; i++) {
+            f32[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
+        }
+    } else {
+        const struct ggml_type_traits * tr = ggml_get_type_traits(src->type);
+        if (!tr || !tr->to_float) {
+            fprintf(stderr, "[GGUF] FATAL: unsupported conv weight type %s for '%s'\n", ggml_type_name(src->type),
+                    name.c_str());
+            exit(1);
+        }
+        tr->to_float(raw, f32.data(), (int64_t) n);
+    }
+
+    std::vector<ggml_fp16_t> f16(n);
+    ggml_fp32_to_fp16_row(f32.data(), f16.data(), (int) n);
+    ggml_backend_tensor_set(dst, f16.data(), 0, n * sizeof(ggml_fp16_t));
 }
 
 // Fuse Q, K, V projection weights into a single tensor [ne0, q_ne1 + k_ne1 + v_ne1].

@@ -99,7 +99,7 @@ static bool hubert_feat_load(HubertFeatExtractor * h, const GGUFModel & gf, ggml
         L.oc                = D[i];
         L.has_norm          = (i == 0);
         std::string pf      = "semantic_model.feature_extractor.conv_layers." + std::to_string(i);
-        L.cw                = ggml_new_tensor_3d(ctx, gf_get_type(gf, pf + ".conv.weight"), K[i], prev_dim, D[i]);
+        L.cw                = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K[i], prev_dim, D[i]);
         if (L.has_norm) {
             L.gn_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D[i]);
             L.gn_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D[i]);
@@ -122,7 +122,7 @@ static bool hubert_feat_load(HubertFeatExtractor * h, const GGUFModel & gf, ggml
     for (int i = 0; i < HUBERT_FEAT_NUM_LAYERS; i++) {
         HubertFeatLayer & L  = h->layers[i];
         std::string       pf = "semantic_model.feature_extractor.conv_layers." + std::to_string(i);
-        dac_load_passthrough(L.cw, gf, pf + ".conv.weight");
+        gf_load_conv_f16(L.cw, gf, pf + ".conv.weight");
         if (L.has_norm) {
             dac_load_bias_f32(L.gn_w, gf, pf + ".layer_norm.weight");
             dac_load_bias_f32(L.gn_b, gf, pf + ".layer_norm.bias");
@@ -245,8 +245,7 @@ static void hubert_proj_free(HubertFeatProjection * p) {
 static struct ggml_tensor * hubert_proj_build_graph(struct ggml_context *        ctx,
                                                     const HubertFeatProjection * p,
                                                     struct ggml_tensor *         x,  // [T, 512] f32
-                                                    struct ggml_tensor **        out_post_ln = NULL
-) {
+                                                    struct ggml_tensor **        out_post_ln = NULL) {
     // (T, C) -> (C, T) so ggml_norm normalizes along ne[0] = C.
     x                       = ggml_cont(ctx, ggml_transpose(ctx, x));
     x                       = ggml_norm(ctx, x, HUBERT_PROJ_LN_EPS);
@@ -534,8 +533,7 @@ static bool hubert_pos_conv_load(HubertPosConv * h, const GGUFModel & gf, ggml_b
     h->weight_ctx                         = ggml_init(gp);
     struct ggml_context * ctx             = h->weight_ctx;
 
-    h->w = ggml_new_tensor_3d(ctx, gf_get_type(gf, "semantic_model.encoder.pos_conv_embed.conv.weight"), HUBERT_POS_K,
-                              HUBERT_POS_IC_PG, HUBERT_HIDDEN);
+    h->w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HUBERT_POS_K, HUBERT_POS_IC_PG, HUBERT_HIDDEN);
     h->b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, HUBERT_HIDDEN);
 
     // Phase 2 : alloc backend
@@ -546,8 +544,8 @@ static bool hubert_pos_conv_load(HubertPosConv * h, const GGUFModel & gf, ggml_b
     }
     ggml_backend_buffer_set_usage(h->weight_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // Phase 3 : fill (BF16 passthrough on the conv kernel, F32 cast on bias).
-    dac_load_passthrough(h->w, gf, "semantic_model.encoder.pos_conv_embed.conv.weight");
+    // Phase 3 : F16 cast on the conv kernel (ARM im2col strict), F32 cast on bias.
+    gf_load_conv_f16(h->w, gf, "semantic_model.encoder.pos_conv_embed.conv.weight");
     dac_load_bias_f32(h->b, gf, "semantic_model.encoder.pos_conv_embed.conv.bias");
 
     return true;
