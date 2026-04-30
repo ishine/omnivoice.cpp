@@ -136,11 +136,11 @@ static void dac_load_passthrough(struct ggml_tensor * dst, const GGUFModel & gf,
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
 }
 
-// Permute ConvTranspose1d weight from source layout (IC, OC, K) row-major to
+// Pre-permute the ConvTranspose1d weight from source layout (IC, OC, K) to
 // the [IC, K*OC] layout col2im_1d expects (k varies faster than oc inside
-// the K*OC axis). The destination keeps the source dtype : we move whole
-// elements of size ggml_type_size(dst->type) regardless of whether they are
-// F32 or BF16.
+// the K*OC axis). The destination is GGML_TYPE_F16 to align with every
+// other DAC conv weight ; widening goes through F32 transiently so any
+// source dtype (F32, F16, BF16, Q8_0, Q4_K, ...) loads identically.
 //
 //   src flat[ic*OC*K + oc*K + k] = w[ic][oc][k]   source-side row-major
 //   dst flat[(oc*K + k)*IC + ic] = w[ic][oc][k]   ggml row-major, ne=(IC, K*OC)
@@ -150,29 +150,50 @@ static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const s
         fprintf(stderr, "[DAC] FATAL: tensor '%s' not found\n", name.c_str());
         exit(1);
     }
-    GGML_ASSERT(dst->type == mt->type);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16);
 
     // ggml ne = (K, OC, IC) since source-side shape is (IC, OC, K) row-major.
     const int    K   = (int) mt->ne[0];
     const int    OC  = (int) mt->ne[1];
     const int    IC  = (int) mt->ne[2];
     const int    KOC = K * OC;
-    const size_t es  = ggml_type_size(dst->type);
+    const size_t n   = (size_t) IC * (size_t) OC * (size_t) K;
 
     GGML_ASSERT(dst->ne[0] == IC && dst->ne[1] == KOC);
 
-    const char *      raw = (const char *) gf_get_data(gf, name.c_str());
-    std::vector<char> packed((size_t) IC * KOC * es);
+    const void *       raw = gf_get_data(gf, name.c_str());
+    std::vector<float> f32(n);
+
+    if (mt->type == GGML_TYPE_F32) {
+        memcpy(f32.data(), raw, n * sizeof(float));
+    } else if (mt->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw, f32.data(), (int64_t) n);
+    } else if (mt->type == GGML_TYPE_BF16) {
+        const uint16_t * p = (const uint16_t *) raw;
+        for (size_t i = 0; i < n; i++) {
+            f32[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
+        }
+    } else {
+        const struct ggml_type_traits * tr = ggml_get_type_traits(mt->type);
+        if (!tr || !tr->to_float) {
+            fprintf(stderr, "[DAC] FATAL: unsupported conv_t1 weight type %s for '%s'\n", ggml_type_name(mt->type),
+                    name.c_str());
+            exit(1);
+        }
+        tr->to_float(raw, f32.data(), (int64_t) n);
+    }
+
+    std::vector<ggml_fp16_t> packed(n);
     for (int ic = 0; ic < IC; ic++) {
         for (int oc = 0; oc < OC; oc++) {
             for (int k = 0; k < K; k++) {
-                size_t src_off = ((size_t) ic * OC * K + (size_t) oc * K + k) * es;
-                size_t dst_off = ((size_t) (oc * K + k) * IC + ic) * es;
-                std::memcpy(packed.data() + dst_off, raw + src_off, es);
+                size_t src_idx  = (size_t) ic * OC * K + (size_t) oc * K + k;
+                size_t dst_idx  = (size_t) (oc * K + k) * IC + ic;
+                packed[dst_idx] = ggml_fp32_to_fp16(f32[src_idx]);
             }
         }
     }
-    ggml_backend_tensor_set(dst, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(dst, packed.data(), 0, n * sizeof(ggml_fp16_t));
 }
 
 // Allocate one snake pair (alpha + inv_b) in f32
@@ -216,7 +237,7 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
 
         std::string pfx = "acoustic_decoder.block." + std::to_string(i);
         dac_alloc_snake(ctx, &b.s1, b.in_ch);
-        b.ctw = ggml_new_tensor_2d(ctx, gf_get_type(gf, pfx + ".conv_t1.weight"), b.in_ch, b.kernel * b.out_ch);
+        b.ctw = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, b.in_ch, b.kernel * b.out_ch);
         b.ctb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, b.out_ch);
 
         for (int r = 0; r < DAC_RES_UNITS; r++) {

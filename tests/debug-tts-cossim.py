@@ -42,8 +42,8 @@ from omnivoice import OmniVoice
 from omnivoice.utils.common import fix_random_seed
 
 BIN        = "../build/omnivoice-tts"
-MODEL_LM   = "../models/omnivoice-base-F32.gguf"
-MODEL_CDC  = "../models/omnivoice-tokenizer-F32.gguf"
+MODEL_LM_T = "../models/omnivoice-base-{q}.gguf"
+MODEL_CDC_T = "../models/omnivoice-tokenizer-{q}.gguf"
 CKPT       = "../checkpoints/OmniVoice"
 DUMP_CPP   = "cpp"
 DUMP_PT    = "python"
@@ -248,9 +248,19 @@ def main():
     ap.add_argument("--instruct", default="male, young adult, moderate pitch")
     ap.add_argument("--lang",     default="French")
     ap.add_argument("--duration", type=float, default=None)
+    ap.add_argument("--quant",    default="F32",
+                    help="quantization suffix for GGUF (default: F32, e.g. BF16, Q8_0, Q4_K_M)")
     ap.add_argument("--out-cpp",  default="cpp/tts-cpp.wav")
     ap.add_argument("--out-pt",   default="python/tts-python.wav")
     args = ap.parse_args()
+
+    model_lm  = MODEL_LM_T.format(q=args.quant)
+    model_cdc = MODEL_CDC_T.format(q=args.quant)
+    for p in (model_lm, model_cdc):
+        if not os.path.isfile(p):
+            print(f"[Error] GGUF not found: {p}")
+            sys.exit(1)
+    print(f"[Quant] {args.quant} -> {model_lm} + {model_cdc}")
 
     ensure_dir(DUMP_CPP)
     ensure_dir(DUMP_PT)
@@ -292,8 +302,8 @@ def main():
     # dumps under cpp/.
     cmd = [
         BIN,
-        "--model",       MODEL_LM,
-        "--codec",       MODEL_CDC,
+        "--model",       model_lm,
+        "--codec",       model_cdc,
         "--seed",        str(args.seed),
         "--instruct",    args.instruct,
         "--lang",        args.lang,

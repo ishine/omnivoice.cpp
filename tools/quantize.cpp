@@ -93,9 +93,10 @@ static bool is_embed(const char * name) {
 // Single source of truth for the quantization policy. Applies to EVERY
 // variant (BF16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, ...) : tensors that return
 // false here keep their source dtype (F32) regardless of the requested
-// type. Conv weights stay F32 because the load-time helper
-// gf_load_conv_f16 casts them to F16 on the backend (ARM im2col strict
-// requirement, see src/gguf-weights.h).
+// type. Conv weights pass through the main loop and fall back to F16 when
+// the row width does not divide the variant block size (kernel K=7,3,1,...).
+// gf_load_conv_f16 then memcpys F16 source straight to the F16 backend
+// tensor (ARM im2col strict requirement, see src/gguf-weights.h).
 //
 // Sensitive tensors that MUST stay in full precision :
 //   quantizer.quantizers.*  RVQ codebooks, project_in / project_out
@@ -123,6 +124,13 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
         return false;
     }
     if (strstr(name, "null_condition_emb")) {
+        return false;
+    }
+    // Snake activation alpha : stored as 3D (1, C, 1), is a per-channel
+    // activation parameter, not a weight. dac_load_alpha widens F32 or BF16
+    // to F32 on the backend with a reciprocal transform, no other dtype
+    // path. Keep it source-dtype in every variant.
+    if (strstr(name, ".snake1.alpha") || strstr(name, ".snake2.alpha")) {
         return false;
     }
     // RVQ codebooks and surrounding linear projections : nearest-neighbor
@@ -179,11 +187,6 @@ static enum ggml_type pick_type(const char *         name,
     }
 
     return v.base;
-}
-
-// Promote 1D tensors (norms/biases) to F32 for precision
-static bool should_promote_f32(int n_dims) {
-    return n_dims < 2;
 }
 
 // Convert source data to F32
@@ -318,7 +321,6 @@ int main(int argc, char ** argv) {
     struct TensorPlan {
         enum ggml_type target;
         bool           quantize;
-        bool           promote;
     };
 
     std::vector<TensorPlan> plans((size_t) n_tensors);
@@ -329,17 +331,9 @@ int main(int argc, char ** argv) {
         const int            n_dims = ggml_n_dims(t);
 
         gguf_add_tensor(out, t);
-        plans[(size_t) i] = { GGML_TYPE_COUNT, false, false };
+        plans[(size_t) i] = { GGML_TYPE_COUNT, false };
 
         enum ggml_type target = pick_type(name, n_dims, arch, *variant, n_layers);
-
-        // Promote 1D norms/biases BF16/F16 -> F32
-        if (target == GGML_TYPE_COUNT && should_promote_f32(n_dims) &&
-            (t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16)) {
-            gguf_set_tensor_type(out, name, GGML_TYPE_F32);
-            plans[(size_t) i] = { GGML_TYPE_F32, false, true };
-            continue;
-        }
 
         if (target == GGML_TYPE_COUNT) {
             continue;
@@ -348,9 +342,18 @@ int main(int argc, char ** argv) {
         bool can_convert = (t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32);
         bool aligned     = (t->ne[0] % ggml_blck_size(target) == 0);
 
+        // Conv kernels (K=7,3,1,...) cannot fit a block-quant row : fall back
+        // to F16. F16 has no block size, 10-bit mantissa beats BF16 (7) and
+        // Q* effective on these weights, and gf_load_conv_f16 memcpys F16
+        // source straight to the F16 backend tensor at load time.
+        if (can_convert && !aligned) {
+            target  = GGML_TYPE_F16;
+            aligned = true;
+        }
+
         if (can_convert && aligned) {
             gguf_set_tensor_type(out, name, target);
-            plans[(size_t) i] = { target, true, false };
+            plans[(size_t) i] = { target, true };
         }
     }
 
@@ -369,7 +372,7 @@ int main(int argc, char ** argv) {
     }
 
     const size_t alignment   = gguf_get_alignment(out);
-    int          n_quantized = 0, n_promoted = 0;
+    int          n_quantized = 0;
     int64_t      bytes_in = 0, bytes_out = 0;
     size_t       data_pos = 0;
 
@@ -393,43 +396,22 @@ int main(int argc, char ** argv) {
 
         const TensorPlan & plan = plans[(size_t) i];
 
-        if (plan.promote) {
-            // BF16/F16 -> F32
-            std::vector<float> f32((size_t) nel);
-            to_f32(src, f32.data(), nel, t->type);
-            size_t out_size = (size_t) nel * sizeof(float);
-            fwrite(f32.data(), 1, out_size, fout);
-            data_pos += out_size;
-            bytes_out += (int64_t) out_size;
-            n_promoted++;
-        } else if (plan.quantize) {
+        if (plan.quantize) {
             // Quantize: src -> f32 -> target
             std::vector<float> f32((size_t) nel);
             to_f32(src, f32.data(), nel, t->type);
 
             const int64_t n_per_row = t->ne[0];
             const int64_t nrows     = nel / n_per_row;
+            const size_t  qsize     = ggml_row_size(plan.target, n_per_row) * (size_t) nrows;
 
-            if (plan.target == GGML_TYPE_BF16) {
-                // F32 -> BF16 simple downcast (drop 16 mantissa LSBs).
-                size_t                   out_size = (size_t) nel * sizeof(ggml_bf16_t);
-                std::vector<ggml_bf16_t> bf16((size_t) nel);
-                ggml_fp32_to_bf16_row(f32.data(), bf16.data(), nel);
-                fwrite(bf16.data(), 1, out_size, fout);
-                data_pos += out_size;
-                bytes_out += (int64_t) out_size;
-                n_quantized++;
-            } else {
-                const size_t qsize = ggml_row_size(plan.target, n_per_row) * (size_t) nrows;
+            std::vector<uint8_t> qbuf(qsize);
+            ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, nullptr);
 
-                std::vector<uint8_t> qbuf(qsize);
-                ggml_quantize_chunk(plan.target, f32.data(), qbuf.data(), 0, nrows, n_per_row, nullptr);
-
-                fwrite(qbuf.data(), 1, qsize, fout);
-                data_pos += qsize;
-                bytes_out += (int64_t) qsize;
-                n_quantized++;
-            }
+            fwrite(qbuf.data(), 1, qsize, fout);
+            data_pos += qsize;
+            bytes_out += (int64_t) qsize;
+            n_quantized++;
         } else {
             // Keep as-is
             fwrite(src, 1, src_size, fout);
@@ -440,7 +422,7 @@ int main(int argc, char ** argv) {
 
     fclose(fout);
 
-    fprintf(stderr, "[Quantize] Quantized %d/%d tensors, promoted %d to F32\n", n_quantized, n_tensors, n_promoted);
+    fprintf(stderr, "[Quantize] Quantized %d/%d tensors\n", n_quantized, n_tensors);
     fprintf(stderr, "[Quantize] %.1f GB -> %.1f GB (%.1fx)\n", (double) bytes_in / 1e9, (double) bytes_out / 1e9,
             bytes_out > 0 ? (double) bytes_in / (double) bytes_out : 0.0);
     fprintf(stderr, "[Quantize] Wrote %s\n", out_path);
