@@ -1,0 +1,21 @@
+@PACKAGE_INIT@
+
+# omnivoiceConfig.cmake : downstream entry for find_package(omnivoice).
+#
+# Provides the imported targets omnivoice::omnivoice-core (always) and
+# omnivoice::omnivoice (only when the upstream build was configured with
+# OMNIVOICE_SHARED=ON). The targets carry their own include directories
+# and link dependencies, so consumers only need :
+#
+#   find_package(omnivoice CONFIG REQUIRED)
+#   target_link_libraries(my_app PRIVATE omnivoice::omnivoice)
+#
+# The exported targets reference ggml as a transitive dependency. We do
+# not auto find_package(ggml) here because the install layout used by
+# llama.cpp / acestep / omnivoice keeps ggml inside the same prefix and
+# its own omnivoice install pulls it via vendored submodule. Downstream
+# users who built with -DGGML_SHARED=ON should link ggml separately.
+
+include("${CMAKE_CURRENT_LIST_DIR}/omnivoiceTargets.cmake")
+
+check_required_components(omnivoice)

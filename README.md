@@ -77,7 +77,7 @@ ov_init_default_params(&iparams);
 iparams.model_path = "models/omnivoice-base-Q8_0.gguf";
 iparams.codec_path = "models/omnivoice-tokenizer-F32.gguf";
 
-struct OmniVoice * ov = ov_init(&iparams);
+struct ov_context * ov = ov_init(&iparams);
 
 struct ov_tts_params params;
 ov_tts_default_params(&params);

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -154,7 +155,7 @@ static int infer_mode(const char * path) {
     return 0;
 }
 
-int main(int argc, char ** argv) {
+int main_impl(int argc, char ** argv) {
     if (argc <= 1) {
         print_usage(argv[0]);
         return 0;
@@ -259,4 +260,16 @@ int main(int argc, char ** argv) {
     pipeline_codec_free(&pc);
     backend_release(bp.backend, bp.cpu_backend);
     return rc;
+}
+
+int main(int argc, char ** argv) {
+    // Top-level boundary : the codec load chain signals fatal errors via
+    // exceptions instead of exit(1). Catching here turns std::terminate
+    // into a clean error line.
+    try {
+        return main_impl(argc, argv);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "[OmniVoice-Codec] FATAL: %s\n", e.what());
+        return 1;
+    }
 }

@@ -9,6 +9,8 @@
  *   2. Every public ov_* symbol has C linkage and links from a C
  *      translation unit.
  *   3. The structs are POD and zero-initialisable with `{0}` from C.
+ *   4. The ov_log_set callback routes formatted messages from the lib to
+ *      the user, and abi_version validation rejects future structs.
  *
  * If this test stops compiling or stops linking, the public ABI has
  * regressed and the build breaks before anything else.
@@ -18,10 +20,32 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static bool stub_cancel(void * ud) {
     (void) ud;
     return false;
+}
+
+/* Counter incremented by the stub log callback. The probe checks that at
+ * least one log line was routed through the callback by triggering an
+ * ov_init failure (which emits a [OmniVoice] ERROR line via ov_log). */
+static int          g_log_lines    = 0;
+static enum ov_log_level g_last_log_level = OV_LOG_DEBUG;
+static char         g_last_log_msg[512] = { 0 };
+
+static void stub_log(enum ov_log_level level, const char * msg, void * user_data) {
+    (void) user_data;
+    g_log_lines++;
+    g_last_log_level = level;
+    if (msg) {
+        size_t n = strlen(msg);
+        if (n >= sizeof(g_last_log_msg)) {
+            n = sizeof(g_last_log_msg) - 1;
+        }
+        memcpy(g_last_log_msg, msg, n);
+        g_last_log_msg[n] = '\0';
+    }
 }
 
 int main(void) {
@@ -36,9 +60,13 @@ int main(void) {
     struct ov_tts_params params;
     ov_tts_default_params(&params);
 
-    /* Sanity-check a few default values. */
+    /* Sanity-check a few default values, including the new abi_version. */
     if (params.mg_num_step != 32 || params.chunk_duration_sec <= 0.0f) {
         fprintf(stderr, "ABI probe : default values do not match\n");
+        return 1;
+    }
+    if (iparams.abi_version != OV_ABI_VERSION || params.abi_version != OV_ABI_VERSION) {
+        fprintf(stderr, "ABI probe : abi_version not set by ov_*_default_params\n");
         return 1;
     }
 
@@ -50,6 +78,10 @@ int main(void) {
 
     struct ov_audio audio = { 0 };
     ov_audio_free(&audio);
+
+    /* Install the log callback before the failing init so the [OmniVoice]
+     * ERROR line lands on stub_log instead of stderr. */
+    ov_log_set(stub_log, NULL);
 
     /* Call every entry through its early-return path. ov_init returns
      * NULL on missing model_path, ov_synthesize / ov_duration_sec_to_tokens
@@ -71,7 +103,33 @@ int main(void) {
         fprintf(stderr, "ABI probe : ov_last_error() empty after a known failure\n");
         return 5;
     }
+
+    /* The same failure must have surfaced through the log callback at
+     * ERROR level. */
+    if (g_log_lines == 0) {
+        fprintf(stderr, "ABI probe : ov_log_set callback never invoked\n");
+        return 6;
+    }
+    if (g_last_log_level != OV_LOG_ERROR) {
+        fprintf(stderr, "ABI probe : last log level was %d, expected %d\n", (int) g_last_log_level,
+                (int) OV_LOG_ERROR);
+        return 7;
+    }
+    printf("omnivoice ABI probe : ov_log_set routed %d line(s), last : '%s'\n", g_log_lines, g_last_log_msg);
     printf("omnivoice ABI probe : ov_last_error reads '%s'\n", err);
+
+    /* abi_version validation : a struct claiming a future ABI must be
+     * rejected up front, before any allocation. */
+    struct ov_init_params future_iparams;
+    ov_init_default_params(&future_iparams);
+    future_iparams.model_path  = "irrelevant.gguf";
+    future_iparams.abi_version = OV_ABI_VERSION + 1;
+    struct ov_context * rejected = ov_init(&future_iparams);
+    if (rejected != NULL) {
+        fprintf(stderr, "ABI probe : ov_init accepted a future abi_version\n");
+        ov_free(rejected);
+        return 8;
+    }
 
     enum ov_status rc = ov_synthesize(NULL, &params, &audio);
     if (rc != OV_STATUS_INVALID_PARAMS) {
@@ -85,6 +143,11 @@ int main(void) {
         fprintf(stderr, "ABI probe : ov_duration_sec_to_tokens returned %d, expected >= 1\n", frames);
         return 4;
     }
+
+    /* Restore the default stderr fallback before exit so the trailing
+     * [OmniVoice] log lines from the cleanup paths land where the user
+     * expects them. */
+    ov_log_set(NULL, NULL);
 
     ov_free(NULL);
     ov_audio_free(&audio);

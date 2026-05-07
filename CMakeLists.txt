@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(omnivoice-ggml VERSION 0.1.0 LANGUAGES C CXX)
+project(omnivoice-ggml LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -121,27 +121,73 @@ if(OMNIVOICE_SHARED)
         C_VISIBILITY_PRESET       hidden
         CXX_VISIBILITY_PRESET     hidden
         VISIBILITY_INLINES_HIDDEN ON
-        SOVERSION                 ${PROJECT_VERSION_MAJOR}
     )
     link_ggml_backends(omnivoice)
 endif()
 
-# Install rules. Public header + library go to the standard prefix
-# layout so downstream consumers can find them via -I and -l.
+# Install rules. Public header + libraries go to the standard prefix
+# layout. Targets are exported under the omnivoice:: namespace so
+# downstream consumers can `find_package(omnivoice CONFIG REQUIRED)` and
+# pull omnivoice::omnivoice (shared) or omnivoice::omnivoice-core (static)
+# without writing their own FindOmnivoice.cmake. A pkg-config .pc file is
+# also generated for non-CMake consumers (Make, Meson, autotools).
+#
+# No version file is generated : the project deliberately tracks builds
+# by git hash + date (see ov_version() and tools/version.cmake) rather
+# than by an invented semver triple. find_package(omnivoice REQUIRED)
+# works ; find_package(omnivoice 1.2 REQUIRED) does not, by design.
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 install(TARGETS omnivoice-core
+    EXPORT  omnivoiceTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 if(OMNIVOICE_SHARED)
     install(TARGETS omnivoice
+        EXPORT  omnivoiceTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 endif()
 install(FILES src/omnivoice.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Export the targets file alongside the package config under
+# <prefix>/lib/cmake/omnivoice/. Namespace omnivoice:: matches every
+# other ggml-stack project (llama::, whisper::).
+set(OMNIVOICE_CMAKE_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/omnivoice)
+
+install(EXPORT omnivoiceTargets
+    FILE        omnivoiceTargets.cmake
+    NAMESPACE   omnivoice::
+    DESTINATION ${OMNIVOICE_CMAKE_INSTALL_DIR}
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/omnivoiceConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/omnivoiceConfig.cmake"
+    INSTALL_DESTINATION ${OMNIVOICE_CMAKE_INSTALL_DIR}
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/omnivoiceConfig.cmake"
+    DESTINATION ${OMNIVOICE_CMAKE_INSTALL_DIR}
+)
+
+# pkg-config : configure_file substitutes the GNU install dirs into the
+# .pc template, then install under the standard pkgconfig dir. The
+# Version: field is intentionally pinned to 0 ; the source of truth is
+# the runtime ov_version() string built from the git hash.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/omnivoice.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/omnivoice.pc"
+    @ONLY
+)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/omnivoice.pc"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # quantize: GGUF requantizer (BF16 -> K-quants), shared with acestep.cpp policy
 add_executable(quantize tools/quantize.cpp)

@@ -6,10 +6,12 @@
 // same binary, refcounted.
 
 #include "ggml-backend.h"
+#include "ov-error.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 
 struct BackendPair {
@@ -68,7 +70,7 @@ static ggml_backend_t cpu_backend_new(int n_threads) {
 static BackendPair backend_init(const char * label) {
     if (g_backend_refs > 0) {
         g_backend_refs++;
-        fprintf(stderr, "[Load] %s backend: %s (shared)\n", label, ggml_backend_name(g_backend_cache.backend));
+        ov_log(OV_LOG_INFO, "[Load] %s backend: %s (shared)", label, ggml_backend_name(g_backend_cache.backend));
         return g_backend_cache;
     }
 
@@ -81,18 +83,25 @@ static BackendPair backend_init(const char * label) {
     if (force_backend) {
         bp.backend = ggml_backend_init_by_name(force_backend, nullptr);
         if (!bp.backend) {
-            fprintf(stderr, "[Load] ERROR: GGML_BACKEND=%s not found. Available:", force_backend);
+            // Assemble the device list inline so the log callback gets one
+            // self-contained line instead of three. The available list can
+            // grow with each backend that registers, so a std::string here
+            // keeps the formatting allocation-free for the common case.
+            std::string msg = "[Load] GGML_BACKEND=";
+            msg += force_backend;
+            msg += " not found. Available:";
             for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
+                msg += ' ';
+                msg += ggml_backend_dev_name(ggml_backend_dev_get(i));
             }
-            fprintf(stderr, "\n");
+            ov_log(OV_LOG_ERROR, "%s", msg.c_str());
             return BackendPair{};
         }
     } else {
         bp.backend = ggml_backend_init_best();
     }
     if (!bp.backend) {
-        fprintf(stderr, "[Load] ERROR: no backend available\n");
+        ov_log(OV_LOG_ERROR, "[Load] no backend available");
         return BackendPair{};
     }
     bool best_is_cpu = (strcmp(ggml_backend_name(bp.backend), "CPU") == 0);
@@ -105,14 +114,14 @@ static BackendPair backend_init(const char * label) {
         bp.cpu_backend = cpu_backend_new(n_threads);
     }
     if (!bp.cpu_backend) {
-        fprintf(stderr, "[Load] ERROR: failed to init CPU backend\n");
+        ov_log(OV_LOG_ERROR, "[Load] failed to init CPU backend");
         if (bp.backend && bp.backend != bp.cpu_backend) {
             ggml_backend_free(bp.backend);
         }
         return BackendPair{};
     }
     bp.has_gpu = !best_is_cpu;
-    fprintf(stderr, "[Load] %s backend: %s (CPU threads: %d)\n", label, ggml_backend_name(bp.backend), n_threads);
+    ov_log(OV_LOG_INFO, "[Load] %s backend: %s (CPU threads: %d)", label, ggml_backend_name(bp.backend), n_threads);
 
     g_backend_cache = bp;
     g_backend_refs  = 1;
@@ -155,7 +164,7 @@ static ggml_backend_sched_t backend_sched_new(BackendPair bp, int max_nodes) {
 
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, n, max_nodes, false, true);
     if (!sched) {
-        fprintf(stderr, "[Load] ERROR: failed to create scheduler\n");
+        ov_log(OV_LOG_ERROR, "[Load] failed to create scheduler");
         return nullptr;
     }
     return sched;

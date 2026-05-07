@@ -42,17 +42,23 @@ extern "C" {
 #    define OV_API
 #endif
 
-// Library API/ABI version. Bumped manually : MAJOR on breaking changes,
-// MINOR on additive changes, PATCH on bug fixes. The runtime ov_version()
-// returns this number plus the git hash and commit date embedded by
-// version.cmake at build time.
-#define OV_VERSION_MAJOR 0
-#define OV_VERSION_MINOR 1
-#define OV_VERSION_PATCH 0
+// Struct ABI version. Incremented every time a public POD struct grows a
+// new field at the end. Callers fill `.abi_version = OV_ABI_VERSION` (or
+// let ov_*_default_params set it). Entries that consume those structs
+// reject inputs whose abi_version exceeds the build-time constant : this
+// guards a binary built against vN from receiving a struct laid out for
+// vN+1 by a freshly compiled binding. Adding fields stays backward-compat
+// because the new tail is zero-init in older callers and the lib reads
+// only what its abi_version permits.
+//
+// There is no separate semver triple. The runtime build identity is the
+// git short hash + commit date string returned by ov_version() ; for
+// binding compat checks, OV_ABI_VERSION is the only number that matters.
+#define OV_ABI_VERSION 1
 
-// Returns a static string of the form "MAJOR.MINOR.PATCH (git-hash, date)".
-// Safe to call from any thread, no allocation. Pointer stays valid for the
-// process lifetime.
+// Returns a static string of the form "<git-hash> (<date>)" identifying
+// the exact commit this binary was built from. Safe to call from any
+// thread, no allocation. Pointer stays valid for the process lifetime.
 OV_API const char * ov_version(void);
 
 // Status code returned by every fallible entry. OV_STATUS_OK is always
@@ -98,8 +104,10 @@ struct ov_context;
 // codec_path is NULL the codec module is skipped and ov_synthesize fails
 // immediately with OV_STATUS_INVALID_PARAMS. use_fa enables flash
 // attention when a GPU backend is present ; clamp_fp16 guards FP16
-// matmul accumulation on sub-Ampere CUDA.
+// matmul accumulation on sub-Ampere CUDA. abi_version stays first so a
+// future struct growth keeps reading the version field at offset 0.
 struct ov_init_params {
+    int          abi_version;
     const char * model_path;
     const char * codec_path;
     bool         use_fa;
@@ -124,12 +132,40 @@ OV_API void ov_free(struct ov_context * ov);
 // cancel granularity is roughly chunk_duration_sec.
 typedef bool (*ov_cancel_cb)(void * user_data);
 
+// Log severity. Numerically ordered so a callback can filter with a
+// simple `if (level < threshold) return;`. ERROR is reserved for failure
+// reports that the lib also surfaces via ov_status / ov_last_error ;
+// WARN for recoverable surprises ; INFO for the normal load and
+// synthesis cadence ; DEBUG for tensor-level cossim diagnostics.
+enum ov_log_level {
+    OV_LOG_DEBUG = 0,
+    OV_LOG_INFO  = 1,
+    OV_LOG_WARN  = 2,
+    OV_LOG_ERROR = 3,
+};
+
+// Logging callback. msg is a NUL-terminated UTF-8 string already formatted
+// by the lib, with no trailing newline (the callback is free to add one).
+// user_data is forwarded verbatim from ov_log_set. Called from any thread
+// the lib runs on : the callback must be reentrant.
+typedef void (*ov_log_cb)(enum ov_log_level level, const char * msg, void * user_data);
+
+// Install a global log callback. Passing cb == NULL restores the default
+// behaviour (write to stderr). Safe to call at any point ; takes effect
+// immediately on subsequent log emissions across every thread. Storage
+// is process-wide, not per-handle, matching whisper_log_set / llama_log_set.
+OV_API void ov_log_set(ov_log_cb cb, void * user_data);
+
 // Synthesis parameters. Strings are NULL-terminated UTF-8 ; NULL maps to
 // empty. Reference inputs are mutually exclusive : either pre-encoded
 // tokens [K, ref_T] OR raw 24 kHz mono samples. Passing both fails with
 // OV_STATUS_INVALID_PARAMS. The MaskGIT sampler config is flattened
 // directly into this struct (seven mg_* fields) to keep it fully POD.
+// abi_version stays first so the lib can route on it before reading any
+// field that may have shifted in a future minor.
 struct ov_tts_params {
+    int abi_version;
+
     // Input text and language hint. lang accepts "" (auto), "en" or "zh"
     // matching the upstream OmniVoice convention. instruct is the raw
     // attribute string ("female young adult moderate"), validated and

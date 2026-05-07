@@ -23,6 +23,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "ov-error.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +42,7 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     pc->sample_rate = (int) gf_get_u32(pc->gguf, "omnivoice.sample_rate");
     pc->hop_length  = (int) gf_get_u32(pc->gguf, "omnivoice.acoustic.hop_length");
     if (pc->sample_rate == 0 || pc->hop_length == 0) {
-        fprintf(stderr, "[PipelineCodec] FATAL: missing sample_rate or hop_length in GGUF\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] missing sample_rate or hop_length in GGUF");
         gf_close(&pc->gguf);
         return false;
     }
@@ -60,7 +61,7 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     // F32 cast at load : ggml_add CUDA only accepts src1 in F32 or F16.
     pc->fc2_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc2.bias");
     if (!pc->fc2_w || !pc->fc2_b) {
-        fprintf(stderr, "[PipelineCodec] FATAL: missing fc2.weight or fc2.bias\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] missing fc2.weight or fc2.bias");
         wctx_free(&pc->wctx);
         gf_close(&pc->gguf);
         return false;
@@ -69,7 +70,7 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     pc->fc_w = gf_load_tensor(&pc->wctx, pc->gguf, "fc.weight");
     pc->fc_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc.bias");
     if (!pc->fc_w || !pc->fc_b) {
-        fprintf(stderr, "[PipelineCodec] FATAL: missing fc.weight or fc.bias\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] missing fc.weight or fc.bias");
         wctx_free(&pc->wctx);
         gf_close(&pc->gguf);
         return false;
@@ -171,14 +172,14 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
         stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
     }
-    fprintf(stderr, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB\n", HUBERT_NUM_LAYERS,
-            HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
+    ov_log(OV_LOG_INFO, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB",
+           HUBERT_NUM_LAYERS, HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
 
     // All weights are now on the backend. The mmap is no longer needed.
     gf_close(&pc->gguf);
 
-    fprintf(stderr, "[PipelineCodec] Loaded codec: sr=%d hop=%d backend=%s\n", pc->sample_rate, pc->hop_length,
-            ggml_backend_name(backend));
+    ov_log(OV_LOG_INFO, "[PipelineCodec] Loaded codec: sr=%d hop=%d backend=%s", pc->sample_rate, pc->hop_length,
+           ggml_backend_name(backend));
     // Scheduler : routes ops the GPU backend cannot run (e.g. K-quant
     // get_rows on CUDA) to the CPU backend. 4096 nodes covers HuBERT 12L
     // + DAC encoder + DAC decoder graphs.
@@ -193,12 +194,11 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
 
 std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int num_codebooks, int n_frames) {
     if (num_codebooks != RVQ_NUM_CODEBOOKS) {
-        fprintf(stderr, "[PipelineCodec] FATAL: codes have %d codebooks, expected %d\n", num_codebooks,
-                RVQ_NUM_CODEBOOKS);
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] codes have %d codebooks, expected %d", num_codebooks, RVQ_NUM_CODEBOOKS);
         return {};
     }
     if (n_frames <= 0) {
-        fprintf(stderr, "[PipelineCodec] FATAL: n_frames must be > 0\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] n_frames must be > 0");
         return {};
     }
 
@@ -210,7 +210,7 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
     struct ggml_context *   gctx = ggml_init(gp);
     if (!gctx) {
-        fprintf(stderr, "[PipelineCodec] FATAL: ggml_init failed for graph ctx\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] ggml_init failed for graph ctx");
         return {};
     }
 
@@ -270,7 +270,7 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
 
     // Allocate intermediates + input/output buffers in one shot on the backend.
     if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
-        fprintf(stderr, "[PipelineCodec] FATAL: gallocr_alloc_graph failed\n");
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] gallocr_alloc_graph failed");
         ggml_backend_sched_reset(pc->sched);
         ggml_free(gctx);
         return {};
@@ -282,7 +282,7 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     // Compute
     enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
     if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[PipelineCodec] FATAL: graph_compute status=%d\n", (int) st);
+        ov_log(OV_LOG_ERROR, "[PipelineCodec] graph_compute status=%d", (int) st);
         ggml_backend_sched_reset(pc->sched);
         ggml_free(gctx);
         return {};
@@ -297,8 +297,8 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
             FILE * f = fopen(path, "wb");
             fwrite(tmp.data(), sizeof(float), n, f);
             fclose(f);
-            fprintf(stderr, "[PipelineCodec] Dumped %s: %zu f32 values, ne=(%lld, %lld, %lld, %lld)\n", path, n,
-                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+            ov_log(OV_LOG_INFO, "[PipelineCodec] Dumped %s: %zu f32 values, ne=(%lld, %lld, %lld, %lld)", path, n,
+                   (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
         };
         dump_tensor("cpp_rvq_out.raw", latent);
         dump_tensor("cpp_fc2_out.raw", fc2_out);
@@ -423,7 +423,7 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     }
     const int T_a = (int) (e_acoustic.size() / 256);
     if (T_a != T_s) {
-        fprintf(stderr, "[Encode] FATAL: post-DAC T_a=%d does not match HuBERT T_s=%d\n", T_a, T_s);
+        ov_log(OV_LOG_ERROR, "[Encode] post-DAC T_a=%d does not match HuBERT T_s=%d", T_a, T_s);
         return {};
     }
 
@@ -513,8 +513,8 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
             FILE * f = fopen(path, "wb");
             fwrite(tmp.data(), sizeof(float), n, f);
             fclose(f);
-            fprintf(stderr, "[Encode] Dumped %s: %zu f32 values, ne=(%lld, %lld)\n", path, n, (long long) t->ne[0],
-                    (long long) t->ne[1]);
+            ov_log(OV_LOG_INFO, "[Encode] Dumped %s: %zu f32 values, ne=(%lld, %lld)", path, n, (long long) t->ne[0],
+                   (long long) t->ne[1]);
         };
         dump_tensor("cpp_encode_pre_fc.raw", pre_fc);
         dump_tensor("cpp_encode_embed.raw", embed);
@@ -545,6 +545,9 @@ void pipeline_codec_free(PipelineCodec * pc) {
     dac_enc_free(&pc->dac_enc);
     dac_free(&pc->dac);
     wctx_free(&pc->wctx);
+    // Idempotent : releases the GGUF mmap when a throw left it open mid-load,
+    // no-op on the success path where it was closed after wctx_alloc.
+    gf_close(&pc->gguf);
     *pc = {};
 }
 

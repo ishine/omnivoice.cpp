@@ -39,10 +39,10 @@ bool pipeline_tts_load(PipelineTTS * pt, const char * gguf_path, BackendPair bp,
     // so the disabled log fires both for explicit --no-fa and for CPU only
     // runs where the request cannot be honoured.
     if (!pt->use_flash_attn) {
-        fprintf(stderr, "[Load] Flash attention disabled\n");
+        ov_log(OV_LOG_INFO, "[Load] Flash attention disabled");
     }
     if (pt->clamp_fp16) {
-        fprintf(stderr, "[Load] FP16 clamp enabled\n");
+        ov_log(OV_LOG_INFO, "[Load] FP16 clamp enabled");
     }
 
     if (!gf_load(&pt->gguf, gguf_path)) {
@@ -84,6 +84,10 @@ void pipeline_tts_free(PipelineTTS * pt) {
         ggml_backend_sched_free(pt->sched);
     }
     wctx_free(&pt->wctx);
+    // Idempotent : gf_close NULL-checks every handle and zeroes the struct.
+    // The success path already closed the mmap mid-load ; this call is a
+    // no-op there. The throw path leaves it open and this call releases it.
+    gf_close(&pt->gguf);
     *pt = {};
 }
 
@@ -103,7 +107,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
         return {};
     }
     if (K > pt->lm.num_audio_codebook) {
-        fprintf(stderr, "[LM-Forward] FATAL: K=%d exceeds num_audio_codebook=%d\n", K, pt->lm.num_audio_codebook);
+        ov_log(OV_LOG_ERROR, "[LM-Forward] K=%d exceeds num_audio_codebook=%d", K, pt->lm.num_audio_codebook);
         return {};
     }
 
@@ -234,7 +238,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
     ggml_build_forward_expand(graph, logits);
 
     if (!ggml_backend_sched_alloc_graph(pt->sched, graph)) {
-        fprintf(stderr, "[LM-Forward] FATAL: sched_alloc_graph failed (K=%d S=%d)\n", K, S);
+        ov_log(OV_LOG_ERROR, "[LM-Forward] sched_alloc_graph failed (K=%d S=%d)", K, S);
         ggml_free(gctx);
         return {};
     }
@@ -256,7 +260,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
 
     enum ggml_status st = ggml_backend_sched_graph_compute(pt->sched, graph);
     if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[LM-Forward] FATAL: graph_compute status=%d\n", (int) st);
+        ov_log(OV_LOG_ERROR, "[LM-Forward] graph_compute status=%d", (int) st);
         ggml_backend_sched_reset(pt->sched);
         ggml_free(gctx);
         return {};
@@ -366,7 +370,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
                                                     int                       T_audio,
                                                     const char *              dump_hidden_dir) {
     if (!ctx) {
-        fprintf(stderr, "[LM-Forward-Batched] FATAL: ctx is NULL\n");
+        ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] ctx is NULL");
         return {};
     }
     const int B_prime = ctx->B_prime;
@@ -375,12 +379,11 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
         return {};
     }
     if (K > pt->lm.num_audio_codebook) {
-        fprintf(stderr, "[LM-Forward-Batched] FATAL: K=%d exceeds num_audio_codebook=%d\n", K,
-                pt->lm.num_audio_codebook);
+        ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] K=%d exceeds num_audio_codebook=%d", K, pt->lm.num_audio_codebook);
         return {};
     }
     if (T_audio > S) {
-        fprintf(stderr, "[LM-Forward-Batched] FATAL: T_audio=%d exceeds S=%d\n", T_audio, S);
+        ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] T_audio=%d exceeds S=%d", T_audio, S);
         return {};
     }
     // Hidden-state debug dumps still go through the single-forward path so the
@@ -409,8 +412,8 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
             std::vector<float> logits_b =
                 pipeline_tts_llm_forward(pt, ids_b, mask_b, attn_b, K, S, dump_hidden_dir, hidden_name);
             if (logits_b.size() != per_item) {
-                fprintf(stderr, "[LM-Forward-Batched] FATAL: dump-mode item %d returned %zu f32 (expected %zu)\n", b,
-                        logits_b.size(), per_item);
+                ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] dump-mode item %d returned %zu f32 (expected %zu)", b,
+                       logits_b.size(), per_item);
                 return {};
             }
             std::copy(logits_b.begin(), logits_b.end(), out.begin() + (size_t) b * per_item);
@@ -549,7 +552,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
     }
 
     if (!ggml_backend_sched_alloc_graph(pt->sched, graph)) {
-        fprintf(stderr, "[LM-Forward-Batched] FATAL: sched_alloc_graph failed (B'=%d K=%d S=%d)\n", B_prime, K, S);
+        ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] sched_alloc_graph failed (B'=%d K=%d S=%d)", B_prime, K, S);
         ggml_free(gctx);
         return {};
     }
@@ -567,7 +570,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *             pt
 
     enum ggml_status st = ggml_backend_sched_graph_compute(pt->sched, graph);
     if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[LM-Forward-Batched] FATAL: graph_compute status=%d\n", (int) st);
+        ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] graph_compute status=%d", (int) st);
         ggml_backend_sched_reset(pt->sched);
         ggml_free(gctx);
         return {};
@@ -606,7 +609,7 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const char *          dump_dir,
                                            uint32_t *            ctr_lo_inout) {
     if (T <= 0) {
-        fprintf(stderr, "[TTS] FATAL: T=%d must be positive\n", T);
+        ov_log(OV_LOG_ERROR, "[TTS] T=%d must be positive", T);
         return {};
     }
 
@@ -627,8 +630,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
         debug_dump_i32_as_f32(&dbg, "prompt-uncond-ids", uncond_row, ids_shape, 1);
     }
 
-    fprintf(stderr, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d\n", prompt.B_prime, prompt.K, prompt.S_max,
-            prompt.c_len, prompt.u_len);
+    ov_log(OV_LOG_INFO, "[TTS] Prompt: B'=%d K=%d S=%d c_len=%d u_len=%d", prompt.B_prime, prompt.K, prompt.S_max,
+           prompt.c_len, prompt.u_len);
 
     return maskgit_generate(pt, &prompt, mg_cfg, T, dump_dir, ctr_lo_inout);
 }
@@ -687,7 +690,7 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
     const int K       = pt->lm.num_audio_codebook;
     const int mask_id = pt->lm.audio_mask_id;
     if ((int) tokens.size() != K * T) {
-        fprintf(stderr, "[TTS] FATAL: token vector size %zu does not match K*T=%d*%d\n", tokens.size(), K, T);
+        ov_log(OV_LOG_ERROR, "[TTS] token vector size %zu does not match K*T=%d*%d", tokens.size(), K, T);
         return {};
     }
     int n_residual_mask = 0;
@@ -697,8 +700,7 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
         }
     }
     if (n_residual_mask) {
-        fprintf(stderr, "[TTS] FATAL: %d residual mask tokens left after MaskGIT, refusing to decode\n",
-                n_residual_mask);
+        ov_log(OV_LOG_ERROR, "[TTS] %d residual mask tokens left after MaskGIT, refusing to decode", n_residual_mask);
         return {};
     }
 
@@ -707,7 +709,7 @@ static std::vector<float> tts_synthesize_one_chunk(PipelineTTS *         pt,
     int tokens_shape[2] = { K, T };
     debug_dump_i32_as_f32(&dbg, "mg-tokens", tokens.data(), tokens_shape, 2);
 
-    fprintf(stderr, "[TTS] Decode: K=%d T=%d expected_samples=%d\n", K, T, T * pc->hop_length);
+    ov_log(OV_LOG_INFO, "[TTS] Decode: K=%d T=%d expected_samples=%d", K, T, T * pc->hop_length);
     std::vector<float> audio = pipeline_codec_decode(pc, tokens.data(), K, T);
 
     if (!audio.empty()) {
@@ -769,8 +771,8 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
     uint32_t shared_ctr_lo = 0;
 
     if (no_chunk) {
-        fprintf(stderr, "[TTS-Long] Single-shot path: T=%d frames (%.2fs), threshold=%d frames\n", T_total,
-                (float) T_total / (float) frame_rate, threshold_frames);
+        ov_log(OV_LOG_INFO, "[TTS-Long] Single-shot path: T=%d frames (%.2fs), threshold=%d frames", T_total,
+               (float) T_total / (float) frame_rate, threshold_frames);
 
         audio = tts_synthesize_one_chunk(pt, pc, tok, text, lang, instruct, T_total, denoise, mg_cfg, ref_text,
                                          ext_ref_tokens, ext_ref_T, dump_dir, &shared_ctr_lo);
@@ -795,12 +797,12 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, 3);
 
         if (chunks.empty()) {
-            fprintf(stderr, "[TTS-Long] FATAL: chunker produced no chunks for input of %d chars\n", n_chars);
+            ov_log(OV_LOG_ERROR, "[TTS-Long] chunker produced no chunks for input of %d chars", n_chars);
             return {};
         }
 
-        fprintf(stderr, "[TTS-Long] Chunked: %d chunks, T_total=%d frames, chunk_len=%d codepoints\n",
-                (int) chunks.size(), T_total, chunk_len);
+        ov_log(OV_LOG_INFO, "[TTS-Long] Chunked: %d chunks, T_total=%d frames, chunk_len=%d codepoints",
+               (int) chunks.size(), T_total, chunk_len);
 
         std::vector<std::vector<float>> chunk_audios;
         chunk_audios.reserve(chunks.size());
@@ -814,7 +816,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
 
         for (size_t i = 0; i < chunks.size(); i++) {
             if (tts_should_cancel(cc)) {
-                fprintf(stderr, "[TTS-Long] Cancelled at chunk %zu/%zu\n", i, chunks.size());
+                ov_log(OV_LOG_INFO, "[TTS-Long] Cancelled at chunk %zu/%zu", i, chunks.size());
                 return {};
             }
             const std::string & ct = chunks[i];
@@ -833,8 +835,8 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
             // compare matching chunks across Python and C++.
             const char * chunk_dump_dir = (i == 0) ? dump_dir : NULL;
 
-            fprintf(stderr, "[TTS-Long] Chunk %zu/%zu: chars=%d T=%d ref_T=%d\n", i + 1, chunks.size(),
-                    chunker_utf8_count(ct), Ti, this_T);
+            ov_log(OV_LOG_INFO, "[TTS-Long] Chunk %zu/%zu: chars=%d T=%d ref_T=%d", i + 1, chunks.size(),
+                   chunker_utf8_count(ct), Ti, this_T);
 
             if (first_no_ref) {
                 // Capture audio tokens before decoding so they can become the
@@ -843,20 +845,20 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                                                       this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
 
                 if (chunk0_tokens.empty()) {
-                    fprintf(stderr, "[TTS-Long] FATAL: chunk 0 generate failed\n");
+                    ov_log(OV_LOG_ERROR, "[TTS-Long] chunk 0 generate failed");
                     return {};
                 }
 
                 const int K = pt->lm.num_audio_codebook;
                 if ((int) chunk0_tokens.size() != K * Ti) {
-                    fprintf(stderr, "[TTS-Long] FATAL: chunk 0 token shape mismatch %zu vs K*T=%d*%d\n",
-                            chunk0_tokens.size(), K, Ti);
+                    ov_log(OV_LOG_ERROR, "[TTS-Long] chunk 0 token shape mismatch %zu vs K*T=%d*%d",
+                           chunk0_tokens.size(), K, Ti);
                     return {};
                 }
 
                 std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti);
                 if (a.empty()) {
-                    fprintf(stderr, "[TTS-Long] FATAL: chunk 0 decode failed\n");
+                    ov_log(OV_LOG_ERROR, "[TTS-Long] chunk 0 decode failed");
                     return {};
                 }
 
@@ -883,7 +885,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
                     tts_synthesize_one_chunk(pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
                                              this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
                 if (a.empty()) {
-                    fprintf(stderr, "[TTS-Long] FATAL: chunk %zu synthesize failed\n", i);
+                    ov_log(OV_LOG_ERROR, "[TTS-Long] chunk %zu synthesize failed", i);
                     return {};
                 }
 
@@ -894,11 +896,11 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
         audio = cross_fade_chunks(chunk_audios, sr, 0.3);
 
         if (audio.empty()) {
-            fprintf(stderr, "[TTS-Long] FATAL: cross-fade produced empty output\n");
+            ov_log(OV_LOG_ERROR, "[TTS-Long] cross-fade produced empty output");
             return {};
         }
 
-        fprintf(stderr, "[TTS-Long] Cross-faded %d chunks -> %zu samples\n", (int) chunk_audios.size(), audio.size());
+        ov_log(OV_LOG_INFO, "[TTS-Long] Cross-faded %d chunks -> %zu samples", (int) chunk_audios.size(), audio.size());
     }
 
     // Post-processing: matches _post_process_audio in omnivoice.py.
@@ -920,8 +922,8 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
 
     fade_and_pad(audio, sr, 0.1, 0.1);
 
-    fprintf(stderr, "[TTS-Long] Post-proc: %zu -> %zu samples (%.2fs at %d Hz, ref_rms=%.4f)\n", before, audio.size(),
-            (float) audio.size() / (float) sr, sr, ref_rms);
+    ov_log(OV_LOG_INFO, "[TTS-Long] Post-proc: %zu -> %zu samples (%.2fs at %d Hz, ref_rms=%.4f)", before, audio.size(),
+           (float) audio.size() / (float) sr, sr, ref_rms);
 
     return audio;
 }
@@ -936,7 +938,7 @@ bool pipeline_tts_resolve_instruct(const VoiceDesign * vd,
     bool        use_zh = voice_design_has_cjk(text);
     std::string err;
     if (!voice_design_normalize(vd, raw, use_zh, out, &err)) {
-        fprintf(stderr, "[TTS] ERROR: %s\n", err.c_str());
+        ov_log(OV_LOG_ERROR, "[TTS] %s", err.c_str());
         return false;
     }
     return true;
@@ -1015,7 +1017,7 @@ static std::vector<float> tts_encode_ref_and_synth(PipelineTTS *         pt,
             v *= gain;
         }
 
-        fprintf(stderr, "[TTS] Reference: RMS %.4f -> 0.1 gain %.4f\n", ref_rms, gain);
+        ov_log(OV_LOG_INFO, "[TTS] Reference: RMS %.4f -> 0.1 gain %.4f", ref_rms, gain);
     }
 
     // Mirror Python preprocess_prompt: silence-trim the reference clip with
@@ -1023,28 +1025,28 @@ static std::vector<float> tts_encode_ref_and_synth(PipelineTTS *         pt,
     if (preprocess_prompt) {
         size_t before = ref_audio.size();
         remove_silence(ref_audio, 24000, 200, 100, 200, -50.0);
-        fprintf(stderr, "[TTS] Reference: silence-trim %zu -> %zu samples\n", before, ref_audio.size());
+        ov_log(OV_LOG_INFO, "[TTS] Reference: silence-trim %zu -> %zu samples", before, ref_audio.size());
     }
 
     int n_in      = (int) ref_audio.size();
     int n_aligned = (n_in / pc->hop_length) * pc->hop_length;
-    fprintf(stderr, "[TTS] Reference: %d samples @ 24 kHz mono (%.2f s), aligned to %d (clip %d)\n", n_in,
-            (double) n_in / 24000.0, n_aligned, n_in - n_aligned);
+    ov_log(OV_LOG_INFO, "[TTS] Reference: %d samples @ 24 kHz mono (%.2f s), aligned to %d (clip %d)", n_in,
+           (double) n_in / 24000.0, n_aligned, n_in - n_aligned);
 
     std::vector<int32_t> ref_codes = pipeline_codec_encode(pc, ref_audio.data(), n_aligned, dump_dir);
     if (ref_codes.empty()) {
-        fprintf(stderr, "[TTS] ERROR: codec_encode failed on reference audio\n");
+        ov_log(OV_LOG_ERROR, "[TTS] codec_encode failed on reference audio");
         return {};
     }
 
     const int K = pt->lm.num_audio_codebook;
     if ((int) ref_codes.size() % K != 0) {
-        fprintf(stderr, "[TTS] ERROR: ref codes size %zu not divisible by K=%d\n", ref_codes.size(), K);
+        ov_log(OV_LOG_ERROR, "[TTS] ref codes size %zu not divisible by K=%d", ref_codes.size(), K);
         return {};
     }
 
     int ref_T = (int) ref_codes.size() / K;
-    fprintf(stderr, "[TTS] Reference: encoded to [K=%d, T=%d] codes\n", K, ref_T);
+    ov_log(OV_LOG_INFO, "[TTS] Reference: encoded to [K=%d, T=%d] codes", K, ref_T);
     if (dump_dir) {
         DebugDumper dbg;
         debug_init(&dbg, dump_dir);
@@ -1079,7 +1081,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     bool has_tokens = (params->ref_audio_tokens != nullptr) && (params->ref_T > 0);
     if (has_raw && has_tokens) {
         ov_set_error("ov_synthesize : ref_audio_24k and ref_audio_tokens are mutually exclusive");
-        fprintf(stderr, "[TTS] ERROR: ref_audio_24k and ref_audio_tokens are mutually exclusive\n");
+        ov_log(OV_LOG_ERROR, "[TTS] ref_audio_24k and ref_audio_tokens are mutually exclusive");
         return OV_STATUS_INVALID_PARAMS;
     }
 
@@ -1152,7 +1154,7 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     float * samples = (float *) malloc(bytes);
     if (!samples) {
         ov_set_error("ov_synthesize : malloc failed for %zu bytes of output audio", bytes);
-        fprintf(stderr, "[TTS] ERROR: malloc failed for %zu bytes of output audio\n", bytes);
+        ov_log(OV_LOG_ERROR, "[TTS] malloc failed for %zu bytes of output audio", bytes);
         return OV_STATUS_OOM;
     }
     memcpy(samples, audio.data(), bytes);

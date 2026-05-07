@@ -18,10 +18,12 @@
 #include "version.h"
 #include "voice-design.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 // Internal definition of the opaque handle. C++ types are fine here
@@ -68,18 +70,83 @@ void ov_set_error(const char * fmt, ...) {
     va_end(ap);
 }
 
+// Formats a message with printf semantics and throws std::runtime_error.
+// The catch sites at the ABI boundary inspect the what() string and feed
+// it into ov_set_error so the user-visible diagnostic is identical
+// whether the failure used the bool-return path or the throw path.
+void ov_throw(const char * fmt, ...) {
+    char buf[1024];
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+    } else {
+        buf[0] = '\0';
+    }
+    throw std::runtime_error(buf);
+}
+
+// Process-wide log callback. Atomic so ov_log_set can replace it without
+// locking : write happens with memory_order_release, every reader sees a
+// fully published callback pointer paired with its user_data slot.
+// std::atomic on a function pointer is lock-free on every platform we
+// target. user_data is a plain pointer because it is only ever published
+// alongside cb under the same release ordering.
+static std::atomic<ov_log_cb> g_log_cb{ nullptr };
+static void *                 g_log_cb_user = nullptr;
+
+void ov_log_set(ov_log_cb cb, void * user_data) {
+    g_log_cb_user = user_data;
+    g_log_cb.store(cb, std::memory_order_release);
+}
+
+// Routes one log line to the installed callback or to stderr. Two-pass
+// vsnprintf sizes the heap buffer when the message exceeds the stack
+// scratchpad, which keeps the common case allocation-free.
+void ov_log(enum ov_log_level level, const char * fmt, ...) {
+    if (!fmt) {
+        return;
+    }
+
+    char    stackbuf[512];
+    char *  buf    = stackbuf;
+    int     needed = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    {
+        va_list ap2;
+        va_copy(ap2, ap);
+        needed = std::vsnprintf(stackbuf, sizeof(stackbuf), fmt, ap2);
+        va_end(ap2);
+    }
+    if (needed < 0) {
+        va_end(ap);
+        return;
+    }
+    std::string heapbuf;
+    if ((size_t) needed >= sizeof(stackbuf)) {
+        heapbuf.resize((size_t) needed);
+        std::vsnprintf(heapbuf.data(), (size_t) needed + 1, fmt, ap);
+        buf = heapbuf.data();
+    }
+    va_end(ap);
+
+    ov_log_cb cb = g_log_cb.load(std::memory_order_acquire);
+    if (cb) {
+        cb(level, buf, g_log_cb_user);
+    } else {
+        std::fprintf(stderr, "%s\n", buf);
+    }
+}
+
 extern "C" {
 
 const char * ov_version(void) {
-    // Built once at first call. The C++11 magic static guarantees the
-    // initialiser runs exactly once across threads.
-    static const std::string s = [] {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "%d.%d.%d (%s)", OV_VERSION_MAJOR, OV_VERSION_MINOR, OV_VERSION_PATCH,
-                      OMNIVOICE_VERSION);
-        return std::string(buf);
-    }();
-    return s.c_str();
+    // OMNIVOICE_VERSION is a string literal injected by tools/version.cmake
+    // ("<git-hash> (<date>)"), so its storage already has process lifetime
+    // and no formatting wrapper is needed.
+    return OMNIVOICE_VERSION;
 }
 
 const char * ov_last_error(void) {
@@ -102,13 +169,15 @@ void ov_audio_free(struct ov_audio * a) {
 }
 
 void ov_init_default_params(struct ov_init_params * p) {
-    p->model_path = nullptr;
-    p->codec_path = nullptr;
-    p->use_fa     = true;
-    p->clamp_fp16 = false;
+    p->abi_version = OV_ABI_VERSION;
+    p->model_path  = nullptr;
+    p->codec_path  = nullptr;
+    p->use_fa      = true;
+    p->clamp_fp16  = false;
 }
 
 void ov_tts_default_params(struct ov_tts_params * p) {
+    p->abi_version             = OV_ABI_VERSION;
     p->text                    = nullptr;
     p->lang                    = nullptr;
     p->instruct                = nullptr;
@@ -137,57 +206,60 @@ void ov_tts_default_params(struct ov_tts_params * p) {
 struct ov_context * ov_init(const struct ov_init_params * params) {
     if (!params || !params->model_path) {
         ov_set_error("ov_init : params or model_path is NULL");
-        std::fprintf(stderr, "[OmniVoice] ERROR: ov_init requires a model_path\n");
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_init requires a model_path");
+        return nullptr;
+    }
+    if (params->abi_version > OV_ABI_VERSION) {
+        ov_set_error("ov_init : params->abi_version %d > OV_ABI_VERSION %d (binding compiled against a newer header)",
+                     params->abi_version, OV_ABI_VERSION);
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_init params struct is from a newer ABI (%d > %d)", params->abi_version,
+               OV_ABI_VERSION);
         return nullptr;
     }
 
-    std::fprintf(stderr, "[OmniVoice] omnivoice.cpp %s\n", ov_version());
+    ov_log(OV_LOG_INFO, "[OmniVoice] omnivoice.cpp %s", ov_version());
 
     // new ov_context() value-initialises every field : POD aggregates
     // (BackendPair, PipelineTTS, PipelineCodec) are zero-init, std
     // containers in BPETokenizer construct empty, codec_loaded falls to
     // false. Only VoiceDesign needs explicit population below.
     ov_context * ov = new ov_context();
-
     voice_design_init(&ov->vd);
 
-    // Backend init is shared (refcounted) across modules in the same
-    // binary, so ov_init / ov_free pairs balance the refcount cleanly.
-    ov->bp = backend_init("LM");
-    if (!ov->bp.backend) {
-        ov_set_error("ov_init : backend_init failed (no GGML backend available)");
-        delete ov;
-        return nullptr;
-    }
-
-    if (!pipeline_tts_load(&ov->pt, params->model_path, ov->bp, params->use_fa, params->clamp_fp16)) {
-        ov_set_error("ov_init : pipeline_tts_load failed for '%s'", params->model_path);
-        backend_release(ov->bp.backend, ov->bp.cpu_backend);
-        delete ov;
-        return nullptr;
-    }
-
-    // BPE tokenizer payload lives inside the same LM GGUF as the weights.
-    // Load the base vocab + the OmniVoice-specific special tokens in one
-    // shot.
-    if (!load_bpe_from_gguf(&ov->tok, params->model_path) ||
-        !bpe_load_omnivoice_specials(&ov->tok, params->model_path)) {
-        ov_set_error("ov_init : BPE / OmniVoice specials load failed for '%s'", params->model_path);
-        pipeline_tts_free(&ov->pt);
-        backend_release(ov->bp.backend, ov->bp.cpu_backend);
-        delete ov;
-        return nullptr;
-    }
-
-    if (params->codec_path) {
-        if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
-            ov_set_error("ov_init : pipeline_codec_load failed for '%s'", params->codec_path);
-            pipeline_tts_free(&ov->pt);
-            backend_release(ov->bp.backend, ov->bp.cpu_backend);
-            delete ov;
-            return nullptr;
+    // The load chain runs inside a try block. Any failure deep in the GGUF
+    // reader, the audio tokenizer load or the LM weight load throws via
+    // ov_throw ; the catch funnels every variant into one cleanup via
+    // ov_free, which is idempotent on partial state (NULL-safe sched, NULL
+    // GGUF handles, refcount-correct backend release).
+    try {
+        ov->bp = backend_init("LM");
+        if (!ov->bp.backend) {
+            ov_throw("ov_init : backend_init failed (no GGML backend available)");
         }
-        ov->codec_loaded = true;
+
+        if (!pipeline_tts_load(&ov->pt, params->model_path, ov->bp, params->use_fa, params->clamp_fp16)) {
+            ov_throw("ov_init : pipeline_tts_load failed for '%s'", params->model_path);
+        }
+
+        // BPE tokenizer payload lives inside the same LM GGUF as the weights.
+        // Load the base vocab + the OmniVoice-specific special tokens in one
+        // shot.
+        if (!load_bpe_from_gguf(&ov->tok, params->model_path) ||
+            !bpe_load_omnivoice_specials(&ov->tok, params->model_path)) {
+            ov_throw("ov_init : BPE / OmniVoice specials load failed for '%s'", params->model_path);
+        }
+
+        if (params->codec_path) {
+            if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
+                ov_throw("ov_init : pipeline_codec_load failed for '%s'", params->codec_path);
+            }
+            ov->codec_loaded = true;
+        }
+    } catch (const std::exception & e) {
+        ov_set_error("%s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
+        ov_free(ov);
+        return nullptr;
     }
 
     return ov;
@@ -213,19 +285,38 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         }
         return OV_STATUS_INVALID_PARAMS;
     }
+    if (params->abi_version > OV_ABI_VERSION) {
+        ov_set_error(
+            "ov_synthesize : params->abi_version %d > OV_ABI_VERSION %d (binding compiled against a newer header)",
+            params->abi_version, OV_ABI_VERSION);
+        ov_audio_free(out);
+        return OV_STATUS_INVALID_PARAMS;
+    }
     if (!ov->codec_loaded) {
         ov_set_error("ov_synthesize : codec not loaded (pass codec_path to ov_init)");
         ov_audio_free(out);
-        std::fprintf(stderr, "[OmniVoice] ERROR: ov_synthesize requires a codec-loaded handle\n");
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_synthesize requires a codec-loaded handle");
         return OV_STATUS_INVALID_PARAMS;
     }
-    return pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
+    // Defense in depth : the synthesis path normally reports failures via
+    // ov_status return + ov_set_error. A future load-style throw or any
+    // std::bad_alloc deep inside the GGML backend is caught here and
+    // converted to OV_STATUS_GENERATE_FAILED so an exception never crosses
+    // the extern "C" boundary.
+    try {
+        return pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
+    } catch (const std::exception & e) {
+        ov_set_error("%s", e.what());
+        ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
+        ov_audio_free(out);
+        return OV_STATUS_GENERATE_FAILED;
+    }
 }
 
 int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) {
     if (!ov || !ov->codec_loaded) {
         ov_set_error("ov_duration_sec_to_tokens : codec not loaded");
-        std::fprintf(stderr, "[OmniVoice] ERROR: ov_duration_sec_to_tokens requires a codec-loaded handle\n");
+        ov_log(OV_LOG_ERROR, "[OmniVoice] ov_duration_sec_to_tokens requires a codec-loaded handle");
         return 1;
     }
     return pipeline_tts_duration_sec_to_tokens(&ov->pc, duration_sec);

@@ -562,7 +562,7 @@ Two layers, picked by use case.
 
 ### Top-level public ABI : src/omnivoice.h
 
-Single-header, plain C99, linkage `extern "C"`. The opaque `OmniVoice`
+Single-header, plain C99, linkage `extern "C"`. The opaque `ov_context`
 handle aggregates the GGML backend pair, the LM pipeline, the audio
 tokenizer codec, the BPE tokenizer and the voice-design vocabulary.
 One init, one free, one synthesize call covers the full TTS path.
@@ -577,7 +577,7 @@ ov_init_default_params(&iparams);
 iparams.model_path = "models/omnivoice-base-Q8_0.gguf";
 iparams.codec_path = "models/omnivoice-tokenizer-F32.gguf";
 
-struct OmniVoice * ov = ov_init(&iparams);
+struct ov_context * ov = ov_init(&iparams);
 
 struct ov_tts_params params;
 ov_tts_default_params(&params);
@@ -777,7 +777,7 @@ src/
   pipeline-tts.{h,cpp}   Full TTS orchestration, single shot and chunked,
                          plus low-level entries kept available for the
                          debug paths and the cossim test harness
-  omnivoice.{h,cpp}      Public ABI : opaque OmniVoice handle, plain C99
+  omnivoice.{h,cpp}      Public ABI : opaque ov_context handle, plain C99
                          header in extern "C", consumable from C, C++,
                          Python ctypes, Rust bindgen, Go cgo
 

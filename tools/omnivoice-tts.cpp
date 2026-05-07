@@ -24,6 +24,7 @@
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -284,7 +285,7 @@ static int run_tts_via_ov(const char * model_path,
     return rc;
 }
 
-int main(int argc, char ** argv) {
+static int main_impl(int argc, char ** argv) {
     if (argc <= 1) {
         print_usage(argv[0]);
         return 0;
@@ -491,9 +492,27 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+    }
 
-        pipeline_tts_free(&pt);
-        backend_release(bp.backend, bp.cpu_backend);
-        return rc;
+    // Shared cleanup for both debug paths (--llm-test and --maskgit-test).
+    // The TTS path returns earlier through run_tts_via_ov, which manages
+    // its own ov_free / backend_release pair.
+    pipeline_tts_free(&pt);
+    backend_release(bp.backend, bp.cpu_backend);
+    return rc;
+}
+
+int main(int argc, char ** argv) {
+    // Top-level boundary : the lib now signals fatal load errors via
+    // exceptions instead of exit(1). The TTS path goes through ov_init
+    // which catches them internally, but the lower-level debug paths
+    // (--llm-test, --maskgit-test) call pipeline_tts_load directly and
+    // need an explicit guard so the user sees a clean error line instead
+    // of a std::terminate trace.
+    try {
+        return main_impl(argc, argv);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "[OmniVoice-TTS] FATAL: %s\n", e.what());
+        return 1;
     }
 }

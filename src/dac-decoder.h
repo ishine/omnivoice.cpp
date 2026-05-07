@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
+#include "ov-error.h"
 
 #include <cmath>
 #include <cstdio>
@@ -84,8 +85,7 @@ struct DACDecoder {
 static void dac_load_alpha(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name, bool reciprocal) {
     struct ggml_tensor * mt = ggml_get_tensor(gf.meta, name.c_str());
     if (!mt) {
-        fprintf(stderr, "[DAC] FATAL: tensor '%s' not found\n", name.c_str());
-        exit(1);
+        ov_throw("[DAC] tensor '%s' not found (alpha)", name.c_str());
     }
     // Stored shape is (1, C, 1). C lives on ne[1] in ggml row-major.
     int                C   = (int) mt->ne[1];
@@ -108,8 +108,7 @@ static void dac_load_alpha(struct ggml_tensor * dst, const GGUFModel & gf, const
 static void dac_load_bias_f32(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
     struct ggml_tensor * mt = ggml_get_tensor(gf.meta, name.c_str());
     if (!mt) {
-        fprintf(stderr, "[DAC] FATAL: tensor '%s' not found\n", name.c_str());
-        exit(1);
+        ov_throw("[DAC] tensor '%s' not found (bias f32)", name.c_str());
     }
     int          C   = (int) mt->ne[0];
     const void * raw = gf_get_data(gf, name.c_str());
@@ -131,8 +130,7 @@ static void dac_load_bias_f32(struct ggml_tensor * dst, const GGUFModel & gf, co
 static void dac_load_passthrough(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
     const void * src = gf_get_data(gf, name.c_str());
     if (!src) {
-        fprintf(stderr, "[DAC] FATAL: tensor '%s' not found\n", name.c_str());
-        exit(1);
+        ov_throw("[DAC] tensor '%s' not found (passthrough)", name.c_str());
     }
     ggml_backend_tensor_set(dst, src, 0, ggml_nbytes(dst));
 }
@@ -148,8 +146,7 @@ static void dac_load_passthrough(struct ggml_tensor * dst, const GGUFModel & gf,
 static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const std::string & name) {
     struct ggml_tensor * mt = ggml_get_tensor(gf.meta, name.c_str());
     if (!mt) {
-        fprintf(stderr, "[DAC] FATAL: tensor '%s' not found\n", name.c_str());
-        exit(1);
+        ov_throw("[DAC] tensor '%s' not found (conv_t1 weight)", name.c_str());
     }
     GGML_ASSERT(dst->type == GGML_TYPE_F16);
 
@@ -177,9 +174,7 @@ static void dac_load_ctw(struct ggml_tensor * dst, const GGUFModel & gf, const s
     } else {
         const struct ggml_type_traits * tr = ggml_get_type_traits(mt->type);
         if (!tr || !tr->to_float) {
-            fprintf(stderr, "[DAC] FATAL: unsupported conv_t1 weight type %s for '%s'\n", ggml_type_name(mt->type),
-                    name.c_str());
-            exit(1);
+            ov_throw("[DAC] unsupported conv_t1 weight type %s for '%s'", ggml_type_name(mt->type), name.c_str());
         }
         tr->to_float(raw, f32.data(), (int64_t) n);
     }
