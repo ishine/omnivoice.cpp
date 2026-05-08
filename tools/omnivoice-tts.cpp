@@ -14,6 +14,8 @@
 #include "omnivoice.h"
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
+#include "text-chunker-stream.h"
+#include "text-chunker.h"
 #include "version.h"
 #include "voice-design.h"
 
@@ -28,6 +30,11 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#    include <fcntl.h>
+#    include <io.h>
+#endif
+
 static void print_usage(const char * prog) {
     fprintf(stderr, "omnivoice.cpp %s\n\n", OMNIVOICE_VERSION);
     fprintf(stderr,
@@ -37,7 +44,10 @@ static void print_usage(const char * prog) {
             "  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
             "  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).\n\n"
             "Input:\n"
-            "  stdin                   Target text to synthesise\n\n"
+            "  stdin                   Target text to synthesise. With -o '-', stdin is read\n"
+            "                          incrementally and synthesis starts as soon as the first\n"
+            "                          sentence boundary is reached. With -o file.wav, stdin is\n"
+            "                          read fully then synthesised in one shot.\n\n"
             "Optional:\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
             "  --lang <str>            Language label (default 'None')\n"
@@ -61,7 +71,8 @@ static void print_usage(const char * prog) {
 }
 
 // Read all of stdin into a string. Trims trailing newlines so the prompt
-// matches what a user typed without invisible suffix tokens.
+// matches what a user typed without invisible suffix tokens. Used by the
+// non-streaming code paths (debug dumps).
 static std::string read_stdin_text() {
     std::ostringstream ss;
     ss << std::cin.rdbuf();
@@ -239,7 +250,6 @@ static int run_tts_via_ov(const char * model_path,
         free(raw);
     }
 
-    std::string text = read_stdin_text();
     std::string lang = prompt_lang ? prompt_lang : "";
 
     // Resolve target frame count override from --duration. When unset, the
@@ -264,6 +274,106 @@ static int run_tts_via_ov(const char * model_path,
         }
     }
 
+    if (stream_to_stdout) {
+        // Streaming stdin -> streaming stdout. Bytes arrive as the upstream
+        // produces them ; the incremental text chunker drives synthesis as
+        // soon as a chunk of text is ready. Each chunk goes through a full
+        // ov_synthesize call with on_chunk forwarding samples to the wav
+        // stream sink. The text chunker is bit-perfect equivalent to the
+        // offline chunk_text_punctuation with min_chunk_len = 0.
+        //
+        // chunk_len is computed from chunk_duration_sec assuming a typical
+        // 1 frame per codepoint ratio (English speech). Languages with a
+        // higher token-per-char ratio (CJK) produce shorter audio per
+        // chunk ; the upstream long-form path measures this ratio from the
+        // full text but the streaming path cannot. The observed audio
+        // chunks therefore stay bounded above by chunk_duration_sec but
+        // may run shorter, which is the safe direction for prosody.
+        const int frame_rate     = 24000 / 480;  // codec hop length, see codec
+        const int chunk_len_text = (int) ((float) frame_rate * chunk_duration_sec);
+
+        text_chunker_stream chunker;
+        chunker.init(chunk_len_text, OMNIVOICE_MIN_CHUNK_LEN);
+
+        int    n_emitted = 0;
+        size_t bytes_in  = 0;
+
+        auto synth_one = [&](const std::string & chunk_text) -> int {
+            ov_tts_params params;
+            ov_tts_default_params(&params);
+            params.text                = chunk_text.c_str();
+            params.lang                = lang.c_str();
+            params.instruct            = prompt_instruct ? prompt_instruct : "";
+            params.T_override          = T_override;
+            params.chunk_duration_sec  = chunk_duration_sec;
+            params.chunk_threshold_sec = chunk_threshold_sec;
+            params.denoise             = prompt_denoise;
+            params.preprocess_prompt   = preprocess_prompt;
+            params.mg_seed             = seed_resolved;
+            params.ref_audio_24k       = ref_audio.empty() ? nullptr : ref_audio.data();
+            params.ref_n_samples       = (int) ref_audio.size();
+            params.ref_text            = ref_text.c_str();
+            params.dump_dir            = dump_dir;
+            params.on_chunk            = [](const float * s, int n, void * ud) -> bool {
+                return wav_stream_write((wav_stream *) ud, s, n);
+            };
+            params.on_chunk_user_data = &ws;
+
+            ov_status status = ov_synthesize(ov, &params, nullptr);
+            if (status != OV_STATUS_OK) {
+                fprintf(stderr, "[OmniVoice-TTS] streaming synth failed on chunk %d: %s\n", n_emitted, ov_last_error());
+                return 1;
+            }
+            n_emitted++;
+            return 0;
+        };
+
+        // Read loop : 4 KiB chunks, push to the incremental chunker, drain
+        // ready chunks, synth each. Block on stdin between reads, no
+        // polling. Suitable for piped LLM output that produces bytes at
+        // its own pace.
+        char   buf[4096];
+        FILE * in = stdin;
+#if defined(_WIN32)
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
+        while (true) {
+            size_t r = fread(buf, 1, sizeof(buf), in);
+            if (r > 0) {
+                bytes_in += r;
+                std::vector<std::string> ready = chunker.push_bytes(buf, r);
+                for (const auto & ct : ready) {
+                    if (synth_one(ct) != 0) {
+                        wav_stream_close(&ws);
+                        ov_free(ov);
+                        return 1;
+                    }
+                }
+            }
+            if (feof(in) || ferror(in)) {
+                break;
+            }
+        }
+
+        std::vector<std::string> tail = chunker.flush_eof();
+        for (const auto & ct : tail) {
+            if (synth_one(ct) != 0) {
+                wav_stream_close(&ws);
+                ov_free(ov);
+                return 1;
+            }
+        }
+
+        wav_stream_close(&ws);
+        ov_free(ov);
+        fprintf(stderr, "[OmniVoice-TTS] streamed %d chunks (%zu bytes input) to stdout\n", n_emitted, bytes_in);
+        return 0;
+    }
+
+    // Buffered path : read full stdin, single ov_synthesize, write WAV file.
+    std::string text = read_stdin_text();
+
     // Defaults mirror OmniVoiceGenerationConfig (Python) : num_step=32,
     // guidance_scale=2.0, t_shift=0.1, layer_penalty_factor=5.0,
     // position_temperature=5.0, class_temperature=0.0. ov_tts_default_params
@@ -283,23 +393,6 @@ static int run_tts_via_ov(const char * model_path,
     params.ref_n_samples       = (int) ref_audio.size();
     params.ref_text            = ref_text.c_str();
     params.dump_dir            = dump_dir;
-
-    if (stream_to_stdout) {
-        params.on_chunk = [](const float * s, int n, void * ud) -> bool {
-            return wav_stream_write((wav_stream *) ud, s, n);
-        };
-        params.on_chunk_user_data = &ws;
-
-        ov_status status = ov_synthesize(ov, &params, nullptr);
-        wav_stream_close(&ws);
-        ov_free(ov);
-        if (status != OV_STATUS_OK) {
-            fprintf(stderr, "[OmniVoice-TTS] streaming synth failed: %s\n", ov_last_error());
-            return 1;
-        }
-        fprintf(stderr, "[OmniVoice-TTS] streamed to stdout\n");
-        return 0;
-    }
 
     ov_audio audio = {};
     if (ov_synthesize(ov, &params, &audio) != OV_STATUS_OK) {

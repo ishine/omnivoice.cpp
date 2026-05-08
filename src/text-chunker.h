@@ -229,6 +229,12 @@ static std::string chunker_strip(const std::string & s) {
     return s.substr(start_byte, after_last_non_ws - start_byte);
 }
 
+// Mirrors min_chunk_len=3 hardcoded in omnivoice/models/omnivoice.py:815.
+// Drops audio chunks shorter than 3 codepoints by folding them into a
+// neighbour, avoiding micro chunk artefacts in the synthesised output.
+// Single source of truth for both the buffered and streaming paths.
+static constexpr int OMNIVOICE_MIN_CHUNK_LEN = 3;
+
 // Splits text on sentence-ending punctuation (skipping abbreviations) and
 // merges sentences into chunks of at most chunk_len codepoints. If
 // min_chunk_len > 0, undersized chunks are merged with a neighbour.

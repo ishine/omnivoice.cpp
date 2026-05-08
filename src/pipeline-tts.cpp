@@ -795,7 +795,7 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
             chunk_len = 1;
         }
 
-        std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, 3);
+        std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, OMNIVOICE_MIN_CHUNK_LEN);
 
         if (chunks.empty()) {
             ov_log(OV_LOG_ERROR, "[TTS-Long] chunker produced no chunks for input of %d chars", n_chars);
@@ -1061,7 +1061,7 @@ static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
             chunk_len = 1;
         }
 
-        std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, 3);
+        std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, OMNIVOICE_MIN_CHUNK_LEN);
         if (chunks.empty()) {
             ov_log(OV_LOG_ERROR, "[TTS-Stream] chunker produced no chunks for input of %d chars", n_chars);
             return OV_STATUS_GENERATE_FAILED;
