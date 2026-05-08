@@ -201,6 +201,8 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->dump_dir                = nullptr;
     p->cancel                  = nullptr;
     p->cancel_user_data        = nullptr;
+    p->on_chunk                = nullptr;
+    p->on_chunk_user_data      = nullptr;
 }
 
 struct ov_context * ov_init(const struct ov_init_params * params) {
@@ -278,23 +280,34 @@ void ov_free(struct ov_context * ov) {
 }
 
 enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out) {
-    if (!ov || !params || !out) {
-        ov_set_error("ov_synthesize : ov / params / out is NULL");
+    if (!ov || !params) {
+        ov_set_error("ov_synthesize : ov / params is NULL");
         if (out) {
             ov_audio_free(out);
         }
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    // Streaming mode (on_chunk non NULL) emits through the callback and
+    // leaves out unused, so out=NULL is valid there. Buffered mode requires
+    // out to receive the synthesised waveform.
+    if (!params->on_chunk && !out) {
+        ov_set_error("ov_synthesize : out is NULL in buffered mode");
         return OV_STATUS_INVALID_PARAMS;
     }
     if (params->abi_version > OV_ABI_VERSION) {
         ov_set_error(
             "ov_synthesize : params->abi_version %d > OV_ABI_VERSION %d (binding compiled against a newer header)",
             params->abi_version, OV_ABI_VERSION);
-        ov_audio_free(out);
+        if (out) {
+            ov_audio_free(out);
+        }
         return OV_STATUS_INVALID_PARAMS;
     }
     if (!ov->codec_loaded) {
         ov_set_error("ov_synthesize : codec not loaded (pass codec_path to ov_init)");
-        ov_audio_free(out);
+        if (out) {
+            ov_audio_free(out);
+        }
         ov_log(OV_LOG_ERROR, "[OmniVoice] ov_synthesize requires a codec-loaded handle");
         return OV_STATUS_INVALID_PARAMS;
     }
@@ -308,7 +321,9 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
-        ov_audio_free(out);
+        if (out) {
+            ov_audio_free(out);
+        }
         return OV_STATUS_GENERATE_FAILED;
     }
 }

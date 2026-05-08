@@ -35,7 +35,7 @@ static void print_usage(const char * prog) {
             "Required:\n"
             "  --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)\n"
             "  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
-            "  -o <path>               Output WAV (24 kHz mono)\n\n"
+            "  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).\n\n"
             "Input:\n"
             "  stdin                   Target text to synthesise\n\n"
             "Optional:\n"
@@ -251,6 +251,19 @@ static int run_tts_via_ov(const char * model_path,
         T_override = ov_duration_sec_to_tokens(ov, prompt_duration_sec);
     }
 
+    // Streaming detection : -o '-' writes a wide RIFF header to stdout up
+    // front and pipes encoded samples as the synthesis emits them. Any
+    // other path uses the buffered route so the file gets accurate sizes
+    // in its header.
+    bool       stream_to_stdout = (output_path[0] == '-' && output_path[1] == '\0');
+    wav_stream ws               = {};
+    if (stream_to_stdout) {
+        if (!wav_stream_open_stdout(&ws, 24000, wav_fmt)) {
+            ov_free(ov);
+            return 1;
+        }
+    }
+
     // Defaults mirror OmniVoiceGenerationConfig (Python) : num_step=32,
     // guidance_scale=2.0, t_shift=0.1, layer_penalty_factor=5.0,
     // position_temperature=5.0, class_temperature=0.0. ov_tts_default_params
@@ -270,6 +283,23 @@ static int run_tts_via_ov(const char * model_path,
     params.ref_n_samples       = (int) ref_audio.size();
     params.ref_text            = ref_text.c_str();
     params.dump_dir            = dump_dir;
+
+    if (stream_to_stdout) {
+        params.on_chunk = [](const float * s, int n, void * ud) -> bool {
+            return wav_stream_write((wav_stream *) ud, s, n);
+        };
+        params.on_chunk_user_data = &ws;
+
+        ov_status status = ov_synthesize(ov, &params, nullptr);
+        wav_stream_close(&ws);
+        ov_free(ov);
+        if (status != OV_STATUS_OK) {
+            fprintf(stderr, "[OmniVoice-TTS] streaming synth failed: %s\n", ov_last_error());
+            return 1;
+        }
+        fprintf(stderr, "[OmniVoice-TTS] streamed to stdout\n");
+        return 0;
+    }
 
     ov_audio audio = {};
     if (ov_synthesize(ov, &params, &audio) != OV_STATUS_OK) {

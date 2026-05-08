@@ -7,6 +7,7 @@
 
 #include "pipeline-tts.h"
 
+#include "audio-postproc-stream.h"
 #include "audio-postproc.h"
 #include "bpe.h"
 #include "debug.h"
@@ -928,6 +929,237 @@ static std::vector<float> tts_synthesize_long_internal(PipelineTTS *         pt,
     return audio;
 }
 
+// Long-form TTS with chunking and streaming post processing.
+// Same orchestration as tts_synthesize_long_internal up to chunk decoding,
+// then drives the audio through a streaming pipeline (cross fade, silence
+// remove, fade and pad) and emits via on_chunk. Voice cloning applies the
+// ref_rms scale per chunk after silence remove ; voice design (ref_rms < 0)
+// skips peak / 0.5 normalisation since the global peak is unknowable in
+// streaming, leaving output 6 to 12 dB below the buffered path.
+// Returns OV_STATUS_OK on success, _CANCELLED if cc fires or on_chunk
+// returns false, _GENERATE_FAILED on any synthesis error.
+static ov_status tts_synthesize_long_stream_internal(PipelineTTS *         pt,
+                                                     PipelineCodec *       pc,
+                                                     const BPETokenizer *  tok,
+                                                     const std::string &   text,
+                                                     const std::string &   lang,
+                                                     const std::string &   instruct,
+                                                     int                   T_override,
+                                                     float                 chunk_duration_sec,
+                                                     float                 chunk_threshold_sec,
+                                                     bool                  denoise,
+                                                     const MaskgitConfig & mg_cfg,
+                                                     const std::string &   ref_text,
+                                                     const int32_t *       ext_ref_tokens,
+                                                     int                   ext_ref_T,
+                                                     float                 ref_rms,
+                                                     const char *          dump_dir,
+                                                     tts_cancel *          cc,
+                                                     ov_audio_chunk_cb     on_chunk,
+                                                     void *                on_chunk_ud) {
+    if (tts_should_cancel(cc)) {
+        return OV_STATUS_CANCELLED;
+    }
+    const int sr         = pc->sample_rate;
+    const int hop        = pc->hop_length;
+    const int frame_rate = sr / hop;
+
+    // Volume scale resolved up front : voice cloning applies ref_rms / 0.1
+    // when the reference is quiet, no op when it is loud ; voice design
+    // (ref_rms < 0) skips peak / 0.5 and runs at native level.
+    float volume_scale = 1.0f;
+    if (ref_rms < 0.0f) {
+        ov_log(OV_LOG_INFO,
+               "[TTS-Stream] voice design + streaming : peak normalisation disabled, "
+               "output level runs ~6 to 12 dB below buffered path");
+    } else if (ref_rms < 0.1f) {
+        volume_scale = ref_rms / 0.1f;
+        ov_log(OV_LOG_INFO, "[TTS-Stream] voice clone scale %.4f (ref_rms %.4f)", volume_scale, ref_rms);
+    }
+
+    // Pipeline stages : cross fade (0.3s), silence remove (mid=500, lead=100,
+    // trail=100, -50 dBFS), volume scale, fade and pad (fade=0.1, pad=0.1).
+    crossfader_stream      cf;
+    silence_remover_stream sr_stage;
+    fade_pad_stream        fp;
+    cf.init(sr, 0.3);
+    sr_stage.init(sr, 500, 100, 100, -50.0);
+    fp.init(sr, 0.1, 0.1);
+
+    bool aborted = false;
+
+    // Innermost emit : forwards to on_chunk and tracks abort.
+    auto emit_to_user = [&](const float * s, int n) -> bool {
+        if (n <= 0) {
+            return true;
+        }
+        if (!on_chunk(s, n, on_chunk_ud)) {
+            aborted = true;
+            return false;
+        }
+        return true;
+    };
+
+    // fade_pad emit : straight to user.
+    auto emit_fp = [&](const float * s, int n) -> bool {
+        return fp.push(s, n, emit_to_user);
+    };
+
+    // silence_remove emit : volume scale (in place on a small buffer) then
+    // forward to fade_pad. The scale = 1 fast path skips the copy.
+    auto emit_post_silence = [&](const float * s, int n) -> bool {
+        if (volume_scale == 1.0f) {
+            return emit_fp(s, n);
+        }
+        std::vector<float> scaled(s, s + n);
+        for (int i = 0; i < n; i++) {
+            scaled[(size_t) i] *= volume_scale;
+        }
+        return emit_fp(scaled.data(), n);
+    };
+
+    // cross_fade emit : forward to silence_remove.
+    auto emit_post_cf = [&](const float * s, int n) -> bool {
+        return sr_stage.push(s, n, emit_post_silence);
+    };
+
+    // Helper that pushes one decoded chunk through the full pipeline.
+    auto push_chunk = [&](const std::vector<float> & a) -> bool {
+        return cf.push(a.data(), (int) a.size(), emit_post_cf);
+    };
+
+    // Same chunking decision as the buffered path : single shot below the
+    // threshold, otherwise split on punctuation and chain chunks.
+    int T_total = (T_override > 0) ? T_override : duration_estimate_tokens(text, ref_text, ext_ref_T);
+
+    int  threshold_frames = (int) (chunk_threshold_sec * (float) frame_rate);
+    bool no_chunk         = (T_override > 0) || (chunk_duration_sec <= 0.0f) || (T_total <= threshold_frames);
+
+    uint32_t shared_ctr_lo = 0;
+
+    if (no_chunk) {
+        ov_log(OV_LOG_INFO, "[TTS-Stream] Single-shot path: T=%d frames (%.2fs), threshold=%d frames", T_total,
+               (float) T_total / (float) frame_rate, threshold_frames);
+
+        std::vector<float> a = tts_synthesize_one_chunk(pt, pc, tok, text, lang, instruct, T_total, denoise, mg_cfg,
+                                                        ref_text, ext_ref_tokens, ext_ref_T, dump_dir, &shared_ctr_lo);
+        if (a.empty()) {
+            return OV_STATUS_GENERATE_FAILED;
+        }
+        if (!push_chunk(a)) {
+            return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+        }
+    } else {
+        int n_chars = chunker_utf8_count(text);
+        if (n_chars < 1) {
+            n_chars = 1;
+        }
+
+        double avg_tokens_per_char = (double) T_total / (double) n_chars;
+        int    chunk_len           = (int) ((double) chunk_duration_sec * (double) frame_rate / avg_tokens_per_char);
+        if (chunk_len < 1) {
+            chunk_len = 1;
+        }
+
+        std::vector<std::string> chunks = chunk_text_punctuation(text, chunk_len, 3);
+        if (chunks.empty()) {
+            ov_log(OV_LOG_ERROR, "[TTS-Stream] chunker produced no chunks for input of %d chars", n_chars);
+            return OV_STATUS_GENERATE_FAILED;
+        }
+
+        ov_log(OV_LOG_INFO, "[TTS-Stream] Chunked: %d chunks, T_total=%d frames, chunk_len=%d codepoints",
+               (int) chunks.size(), T_total, chunk_len);
+
+        const int32_t *      prompt_tokens = ext_ref_tokens;
+        int                  prompt_T      = ext_ref_T;
+        std::string          prompt_text   = ref_text;
+        std::vector<int32_t> chunk0_tokens;
+
+        for (size_t i = 0; i < chunks.size(); i++) {
+            if (tts_should_cancel(cc)) {
+                ov_log(OV_LOG_INFO, "[TTS-Stream] Cancelled at chunk %zu/%zu", i, chunks.size());
+                return OV_STATUS_CANCELLED;
+            }
+            const std::string & ct = chunks[i];
+
+            bool                first_no_ref  = (i == 0 && ext_ref_tokens == NULL);
+            const int32_t *     this_ref      = first_no_ref ? NULL : prompt_tokens;
+            int                 this_T        = first_no_ref ? 0 : prompt_T;
+            const std::string & this_ref_text = first_no_ref ? std::string() : prompt_text;
+
+            int          Ti             = duration_estimate_tokens(ct, this_ref_text, this_T);
+            const char * chunk_dump_dir = (i == 0) ? dump_dir : NULL;
+
+            ov_log(OV_LOG_INFO, "[TTS-Stream] Chunk %zu/%zu: chars=%d T=%d ref_T=%d", i + 1, chunks.size(),
+                   chunker_utf8_count(ct), Ti, this_T);
+
+            if (first_no_ref) {
+                chunk0_tokens = pipeline_tts_generate(pt, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
+                                                      this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                if (chunk0_tokens.empty()) {
+                    ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk 0 generate failed");
+                    return OV_STATUS_GENERATE_FAILED;
+                }
+
+                const int K = pt->lm.num_audio_codebook;
+                if ((int) chunk0_tokens.size() != K * Ti) {
+                    ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk 0 token shape mismatch %zu vs K*T=%d*%d",
+                           chunk0_tokens.size(), K, Ti);
+                    return OV_STATUS_GENERATE_FAILED;
+                }
+
+                std::vector<float> a = pipeline_codec_decode(pc, chunk0_tokens.data(), K, Ti);
+                if (a.empty()) {
+                    ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk 0 decode failed");
+                    return OV_STATUS_GENERATE_FAILED;
+                }
+
+                if (chunk_dump_dir) {
+                    DebugDumper dbg;
+                    debug_init(&dbg, chunk_dump_dir);
+                    int tokens_shape[2] = { K, Ti };
+                    debug_dump_i32_as_f32(&dbg, "mg-tokens", chunk0_tokens.data(), tokens_shape, 2);
+                    debug_dump_1d(&dbg, "output-audio", a.data(), (int) a.size());
+                }
+
+                if (!push_chunk(a)) {
+                    return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+                }
+
+                prompt_tokens = chunk0_tokens.data();
+                prompt_T      = Ti;
+                prompt_text   = ct;
+            } else {
+                std::vector<float> a =
+                    tts_synthesize_one_chunk(pt, pc, tok, ct, lang, instruct, Ti, denoise, mg_cfg, this_ref_text,
+                                             this_ref, this_T, chunk_dump_dir, &shared_ctr_lo);
+                if (a.empty()) {
+                    ov_log(OV_LOG_ERROR, "[TTS-Stream] chunk %zu synthesize failed", i);
+                    return OV_STATUS_GENERATE_FAILED;
+                }
+
+                if (!push_chunk(a)) {
+                    return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+                }
+            }
+        }
+    }
+
+    // Drain stages in pipeline order.
+    if (!cf.flush(emit_post_cf)) {
+        return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+    }
+    if (!sr_stage.flush(emit_post_silence)) {
+        return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+    }
+    if (!fp.flush(emit_to_user)) {
+        return aborted ? OV_STATUS_CANCELLED : OV_STATUS_GENERATE_FAILED;
+    }
+
+    ov_log(OV_LOG_INFO, "[TTS-Stream] Done");
+    return OV_STATUS_OK;
+}
+
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. Picks the target language from the synthesis text : any CJK
 // ideograph -> Chinese, otherwise English.
@@ -955,45 +1187,44 @@ int pipeline_tts_duration_sec_to_tokens(const PipelineCodec * pc, float duration
     return T;
 }
 
-// Encodes the optional raw reference waveform into RVQ codes (when present)
-// and dispatches to tts_synthesize_long_internal. Mirrors the upstream
-// reference preprocessing chain : RMS / auto-gain / add_punctuation /
-// silence-trim / hop alignment / codec encode. ref_audio_24k == NULL or
-// ref_n_samples <= 0 routes to the pure TTS path with ref_rms = -1.
-static std::vector<float> tts_encode_ref_and_synth(PipelineTTS *         pt,
-                                                   PipelineCodec *       pc,
-                                                   const BPETokenizer *  tok,
-                                                   const std::string &   text,
-                                                   const std::string &   lang,
-                                                   const std::string &   instruct,
-                                                   int                   T_override,
-                                                   float                 chunk_duration_sec,
-                                                   float                 chunk_threshold_sec,
-                                                   bool                  denoise,
-                                                   bool                  preprocess_prompt,
-                                                   const MaskgitConfig & mg_cfg,
-                                                   const float *         ref_audio_24k,
-                                                   int                   ref_n_samples,
-                                                   const std::string &   ref_text_in,
-                                                   const char *          dump_dir,
-                                                   tts_cancel *          cc) {
-    // No reference : pure TTS path. ref_rms = -1 routes the post-proc volume
-    // branch to peak / 0.5 normalisation.
-    if (ref_audio_24k == NULL || ref_n_samples <= 0) {
-        return tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, T_override, chunk_duration_sec,
-                                            chunk_threshold_sec, denoise, mg_cfg, "", NULL, 0, -1.0f, dump_dir, cc);
-    }
+// Reference encoding result. has_ref=false signals the no-reference path
+// (voice design) ; the caller routes to the synth helpers with ref_codes
+// empty and ref_rms_for_postproc=-1.
+struct RefEncoded {
+    bool                 has_ref;
+    std::vector<int32_t> ref_codes;
+    int                  ref_T;
+    std::string          ref_text;
+    float                ref_rms_for_postproc;
+};
 
-    // Encode the optional reference WAV into ref_audio_tokens once, before
-    // the synthesize call. The codec encodes 24 kHz mono into [K, T_ref]
-    // i32 codes ; the caller is expected to have resampled and downmixed
-    // already (audio_read_mono or equivalent).
-    std::string ref_text = ref_text_in;
+// Encodes the optional raw reference waveform into RVQ codes. Mirrors the
+// upstream reference preprocessing chain : add_punctuation / RMS / auto-gain
+// / silence-trim / hop alignment / codec encode. Returns has_ref=false when
+// no reference is supplied. Returns has_ref=true with ref_codes empty on
+// encode failure (caller distinguishes via ref_codes.empty()).
+static RefEncoded tts_encode_ref(PipelineTTS *       pt,
+                                 PipelineCodec *     pc,
+                                 const float *       ref_audio_24k,
+                                 int                 ref_n_samples,
+                                 const std::string & ref_text_in,
+                                 bool                preprocess_prompt,
+                                 const char *        dump_dir) {
+    RefEncoded r           = {};
+    r.has_ref              = false;
+    r.ref_T                = 0;
+    r.ref_rms_for_postproc = -1.0f;
+
+    if (ref_audio_24k == NULL || ref_n_samples <= 0) {
+        return r;
+    }
+    r.has_ref  = true;
+    r.ref_text = ref_text_in;
 
     // Mirror Python preprocess_prompt: append a terminal "." (or ideographic
     // full stop for CJK) when missing.
     if (preprocess_prompt) {
-        ref_text = add_punctuation(ref_text);
+        r.ref_text = add_punctuation(r.ref_text);
     }
 
     std::vector<float> ref_audio(ref_audio_24k, ref_audio_24k + ref_n_samples);
@@ -1008,8 +1239,8 @@ static std::vector<float> tts_encode_ref_and_synth(PipelineTTS *         pt,
         sumsq += (double) v * (double) v;
     }
 
-    double ref_rms              = std::sqrt(sumsq / (double) ref_audio.size());
-    float  ref_rms_for_postproc = (float) ref_rms;
+    double ref_rms         = std::sqrt(sumsq / (double) ref_audio.size());
+    r.ref_rms_for_postproc = (float) ref_rms;
 
     if (ref_rms > 0.0 && ref_rms < 0.1) {
         float gain = (float) (0.1 / ref_rms);
@@ -1033,30 +1264,29 @@ static std::vector<float> tts_encode_ref_and_synth(PipelineTTS *         pt,
     ov_log(OV_LOG_INFO, "[TTS] Reference: %d samples @ 24 kHz mono (%.2f s), aligned to %d (clip %d)", n_in,
            (double) n_in / 24000.0, n_aligned, n_in - n_aligned);
 
-    std::vector<int32_t> ref_codes = pipeline_codec_encode(pc, ref_audio.data(), n_aligned, dump_dir);
-    if (ref_codes.empty()) {
+    r.ref_codes = pipeline_codec_encode(pc, ref_audio.data(), n_aligned, dump_dir);
+    if (r.ref_codes.empty()) {
         ov_log(OV_LOG_ERROR, "[TTS] codec_encode failed on reference audio");
-        return {};
+        return r;
     }
 
     const int K = pt->lm.num_audio_codebook;
-    if ((int) ref_codes.size() % K != 0) {
-        ov_log(OV_LOG_ERROR, "[TTS] ref codes size %zu not divisible by K=%d", ref_codes.size(), K);
-        return {};
+    if ((int) r.ref_codes.size() % K != 0) {
+        ov_log(OV_LOG_ERROR, "[TTS] ref codes size %zu not divisible by K=%d", r.ref_codes.size(), K);
+        r.ref_codes.clear();
+        return r;
     }
 
-    int ref_T = (int) ref_codes.size() / K;
-    ov_log(OV_LOG_INFO, "[TTS] Reference: encoded to [K=%d, T=%d] codes", K, ref_T);
+    r.ref_T = (int) r.ref_codes.size() / K;
+    ov_log(OV_LOG_INFO, "[TTS] Reference: encoded to [K=%d, T=%d] codes", K, r.ref_T);
     if (dump_dir) {
         DebugDumper dbg;
         debug_init(&dbg, dump_dir);
-        int ref_shape[2] = { K, ref_T };
-        debug_dump_i32_as_f32(&dbg, "ref-audio-codes", ref_codes.data(), ref_shape, 2);
+        int ref_shape[2] = { K, r.ref_T };
+        debug_dump_i32_as_f32(&dbg, "ref-audio-codes", r.ref_codes.data(), ref_shape, 2);
     }
 
-    return tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, T_override, chunk_duration_sec,
-                                        chunk_threshold_sec, denoise, mg_cfg, ref_text, ref_codes.data(), ref_T,
-                                        ref_rms_for_postproc, dump_dir, cc);
+    return r;
 }
 
 ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
@@ -1065,14 +1295,20 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
                                   const VoiceDesign *   vd,
                                   const ov_tts_params * params,
                                   ov_audio *            out) {
-    if (!params || !out) {
-        ov_set_error("pipeline_tts_synthesize : params or out is NULL");
+    if (!params) {
+        ov_set_error("pipeline_tts_synthesize : params is NULL");
+        return OV_STATUS_INVALID_PARAMS;
+    }
+    if (!params->on_chunk && !out) {
+        ov_set_error("pipeline_tts_synthesize : out is NULL in buffered mode");
         return OV_STATUS_INVALID_PARAMS;
     }
 
-    // Always start from a clean output slot. Failures below leave it empty
-    // so the caller can ov_audio_free unconditionally without surprise.
-    ov_audio_free(out);
+    // Always start from a clean output slot in buffered mode. Failures
+    // below leave it empty so the caller can ov_audio_free unconditionally.
+    if (out) {
+        ov_audio_free(out);
+    }
 
     // Reject ambiguous reference inputs : raw waveform and pre-encoded tokens
     // are mutually exclusive. KISS, the caller is told immediately rather
@@ -1119,24 +1355,58 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
     // poll that returns true.
     tts_cancel cc = { params->cancel, params->cancel_user_data, false };
 
-    std::vector<float> audio;
-    if (has_raw) {
-        // Raw reference path : encode the waveform once, then run the
-        // long-form pipeline with the resulting [K, ref_T] tokens and the
-        // original ref_rms threaded into post-proc.
-        audio =
-            tts_encode_ref_and_synth(pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
-                                     params->chunk_threshold_sec, params->denoise, params->preprocess_prompt, mg_cfg,
-                                     params->ref_audio_24k, params->ref_n_samples, ref_text, params->dump_dir, &cc);
-    } else {
-        // Pre-encoded reference or pure TTS path. ref_rms = -1 routes the
-        // post-proc volume branch to peak / 0.5 normalisation, matching the
-        // no-ref branch upstream when no external reference is supplied.
-        audio = tts_synthesize_long_internal(pt, pc, tok, text, lang, instruct, params->T_override,
-                                             params->chunk_duration_sec, params->chunk_threshold_sec, params->denoise,
-                                             mg_cfg, ref_text, has_tokens ? params->ref_audio_tokens : nullptr,
-                                             has_tokens ? params->ref_T : 0, -1.0f, params->dump_dir, &cc);
+    // Encode the optional raw reference once, before any synthesis. has_raw
+    // false leaves the struct empty with ref_rms_for_postproc=-1, routing the
+    // post-proc volume branch to peak / 0.5 (buffered) or skip (streaming).
+    RefEncoded re =
+        tts_encode_ref(pt, pc, has_raw ? params->ref_audio_24k : nullptr, has_raw ? params->ref_n_samples : 0, ref_text,
+                       params->preprocess_prompt, params->dump_dir);
+    if (has_raw && re.has_ref && re.ref_codes.empty()) {
+        ov_set_error("ov_synthesize : reference encoding failed (see [TTS] log lines)");
+        return OV_STATUS_GENERATE_FAILED;
     }
+
+    // Resolve the reference triple fed to the synthesis helpers. Three
+    // routes : raw waveform freshly encoded, pre-encoded tokens passed in,
+    // or pure TTS with no reference at all.
+    const int32_t * synth_ref_tokens = nullptr;
+    int             synth_ref_T      = 0;
+    std::string     synth_ref_text   = "";
+    float           synth_ref_rms    = -1.0f;
+
+    if (has_raw && re.has_ref) {
+        synth_ref_tokens = re.ref_codes.data();
+        synth_ref_T      = re.ref_T;
+        synth_ref_text   = re.ref_text;
+        synth_ref_rms    = re.ref_rms_for_postproc;
+    } else if (has_tokens) {
+        synth_ref_tokens = params->ref_audio_tokens;
+        synth_ref_T      = params->ref_T;
+        synth_ref_text   = ref_text;
+        synth_ref_rms    = -1.0f;
+    }
+
+    // Streaming path : on_chunk emits chunks of post processed audio at the
+    // codec sample rate, out stays empty on success. Buffered path collects
+    // into a single audio vector and copies into out.
+    if (params->on_chunk) {
+        ov_status rc = tts_synthesize_long_stream_internal(
+            pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec,
+            params->chunk_threshold_sec, params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T,
+            synth_ref_rms, params->dump_dir, &cc, params->on_chunk, params->on_chunk_user_data);
+        if (cc.triggered) {
+            ov_set_error("ov_synthesize : cancelled by ov_cancel_cb");
+            return OV_STATUS_CANCELLED;
+        }
+        if (rc != OV_STATUS_OK) {
+            ov_set_error("ov_synthesize : streaming synthesis failed (see [TTS-Stream] log lines)");
+        }
+        return rc;
+    }
+
+    std::vector<float> audio = tts_synthesize_long_internal(
+        pt, pc, tok, text, lang, instruct, params->T_override, params->chunk_duration_sec, params->chunk_threshold_sec,
+        params->denoise, mg_cfg, synth_ref_text, synth_ref_tokens, synth_ref_T, synth_ref_rms, params->dump_dir, &cc);
 
     if (cc.triggered) {
         ov_set_error("ov_synthesize : cancelled by ov_cancel_cb");

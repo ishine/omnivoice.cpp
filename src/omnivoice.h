@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version() ; for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 1
+#define OV_ABI_VERSION 2
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -131,6 +131,21 @@ OV_API void ov_free(struct ov_context * ov);
 // synthesis to abort. Polled between chunks of long-form output, so the
 // cancel granularity is roughly chunk_duration_sec.
 typedef bool (*ov_cancel_cb)(void * user_data);
+
+// Streaming output callback. When set on ov_tts_params, the synth pipeline
+// runs in streaming mode : audio is post processed and emitted chunk by
+// chunk through this callback rather than accumulated into the `out` buffer
+// of ov_synthesize. Returning false aborts the synthesis with
+// OV_STATUS_CANCELLED, identical to the ov_cancel_cb behaviour. The samples
+// pointer is mono float PCM at the codec sample rate ; valid only for the
+// duration of the call. user_data is forwarded verbatim from on_chunk_user_data.
+//
+// Bit perfect against the buffered path for voice cloning. For voice design
+// (no reference) the streaming pipeline skips peak / 0.5 normalisation since
+// the global peak is unknowable before the last sample : output level then
+// runs roughly 6 to 12 dB below the buffered path. Logged at INFO when this
+// branch fires.
+typedef bool (*ov_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);
 
 // Log severity. Numerically ordered so a callback can filter with a
 // simple `if (level < threshold) return;`. ERROR is reserved for failure
@@ -215,6 +230,12 @@ struct ov_tts_params {
     // cancel_user_data is forwarded to the callback verbatim.
     ov_cancel_cb cancel;
     void *       cancel_user_data;
+
+    // Streaming output. When on_chunk is non NULL, ov_synthesize runs the
+    // streaming pipeline : audio chunks emit through on_chunk and `out`
+    // stays empty on success. on_chunk NULL keeps the buffered path.
+    ov_audio_chunk_cb on_chunk;
+    void *            on_chunk_user_data;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
